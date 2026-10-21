@@ -4,10 +4,11 @@
 #   OUT=1      saves the DOM right after 'install' to /out.img (for the VM test)
 #   CAPTURE=1  writes terminal captures for the README to /captures
 #   NET, REPO  --network and --repo of the first install
+#   DOWNLOAD=1 the first install downloads the installer (published release) instead of --local
 set -euo pipefail
 W=/work
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq && apt-get install -y -qq fdisk e2fsprogs dosfstools iproute2 util-linux >/dev/null
+apt-get update -qq && apt-get install -y -qq fdisk e2fsprogs dosfstools iproute2 util-linux curl ca-certificates >/dev/null
 for i in $(seq 0 31); do [ -e /dev/loop$i ] || mknod -m 660 /dev/loop$i b 7 $i; done
 T=/tmp/dom
 mkdir -p $T/bk $T/b
@@ -29,7 +30,7 @@ conf_sha() { # sha256 of SynoBootLoader.conf in a FAT image
 }
 
 $S status
-$S install --yes --network "${NET:-dhcp}" --hostname nas --lang en --local $INST ${REPO:+--repo "$REPO"} | tee $T/install.out
+$S install --yes --network "${NET:-dhcp}" --hostname nas --lang en ${DOWNLOAD:---local $INST} ${REPO:+--repo "$REPO"} | tee $T/install.out
 grep -q 'Password:' $T/install.out && ok install
 $S status | tee $T/st
 grep -q 'INSTALLER   <- default' $T/st && ok "INSTALLER default"
