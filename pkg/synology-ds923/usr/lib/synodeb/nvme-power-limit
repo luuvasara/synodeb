@@ -1,0 +1,82 @@
+#!/usr/bin/python3 -I
+"""M.2 SSD power limit like DSM.
+
+DS923+ model.dtb: power_limit = "14.85,9.9" -> slot 1 (PCI 0000:00:01.2) 14.85 W,
+slot 2 (0000:00:01.3) 9.9 W. For each NVMe controller pick the operational power state
+with the highest max power <= limit (nvme id-ctrl: psd max_power, in centiwatts
+if MXPS = 0, in tenths of a milliwatt if MXPS = 1; non-operational states are excluded)
+and set it with feature 2 (Power Management). Never fails.
+"""
+import glob
+import json
+import os
+import subprocess
+import sys
+
+LIMITS = {"0000:00:01.2": (1, 14.85), "0000:00:01.3": (2, 9.9)}
+
+
+def log(msg):
+    print(f"nvme-power-limit: {msg}", flush=True)
+
+
+def nvme(*args):
+    r = subprocess.run(["nvme", *args], capture_output=True, text=True, timeout=30)
+    if r.returncode:
+        raise RuntimeError(f"nvme {' '.join(args)}: {r.stderr.strip() or r.returncode}")
+    return r.stdout
+
+
+def states(idc):
+    """[(ps, watts)] of the operational states."""
+    psds = idc.get("psds", idc.get("psd", []))
+    npss = idc.get("npss", len(psds) - 1)
+    out = []
+    for i, p in enumerate(psds[:npss + 1]):
+        flags = int(p.get("flags", 0))
+        nonop = int(p.get("non-operational_state", (flags >> 1) & 1))
+        scale = int(p.get("max_power_scale", flags & 1))
+        mp = p.get("max_power")
+        if mp is None or nonop:
+            continue
+        out.append((i, int(mp) / (10000 if scale else 100)))
+    return out
+
+
+def handle(ctrl):
+    name = os.path.basename(ctrl)
+    path = os.path.realpath(f"{ctrl}/device") + "/"
+    slot = next((s for s in LIMITS if f"/{s}/" in path), None)
+    if not slot:
+        log(f"{name}: not in a DS923+ M.2 slot ({path}), skipping")
+        return
+    n, limit = LIMITS[slot]
+    ops = states(json.loads(nvme("id-ctrl", "-o", "json", f"/dev/{name}")))
+    if not ops:
+        log(f"{name}: no operational power state declared, skipping")
+        return
+    desc = ", ".join(f"PS{i} {w:g} W" for i, w in ops)
+    ok = [s for s in ops if s[1] <= limit + 1e-9]
+    if ok:
+        ps, w = max(ok, key=lambda s: (s[1], -s[0]))
+    else:
+        ps, w = min(ops, key=lambda s: s[1])
+        log(f"{name}: no state within {limit:g} W, using the lowest")
+    nvme("set-feature", f"/dev/{name}", "-f", "2", "-V", str(ps))
+    log(f"{name} (slot {n}, {slot}): limit {limit:g} W, operational states {desc} -> PS{ps} ({w:g} W)")
+
+
+def main():
+    ctrls = sorted(glob.glob("/sys/class/nvme/nvme[0-9]*"))
+    if not ctrls:
+        log("no NVMe controller")
+    for c in ctrls:
+        try:
+            handle(c)
+        except Exception as e:      # never fail the boot
+            log(f"{os.path.basename(c)}: {e}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

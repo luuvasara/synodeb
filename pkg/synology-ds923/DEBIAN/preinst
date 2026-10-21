@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+for f in /etc/systemd/journald.conf.d/synodeb-volatile.conf /etc/systemd/system/synodeb-journal-archive.service \
+         /etc/systemd/system/synodeb-journal-archive-shutdown.service /etc/systemd/system/synodeb-journal-archive.timer \
+         /etc/initramfs-tools/scripts/init-premount/synodeb-rootcheck /etc/initramfs-tools/scripts/init-top/synodeb-bootlog; do
+    dpkg-maintscript-helper rm_conffile "$f" 3.0~ synology-ds923 -- "$@"
+done
+if [ "$1" = upgrade ] && [ -d /run/systemd/system ]; then
+    systemctl disable --now synodeb-journal-archive.timer synodeb-journal-archive-shutdown.service >/dev/null 2>&1 || true
+fi

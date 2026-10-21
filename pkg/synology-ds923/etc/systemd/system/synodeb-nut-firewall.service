@@ -1,0 +1,17 @@
+[Unit]
+Description=synodeb: upsd reachable only from localhost and NETWORK_CLIENTS (nftables table inet synodeb_nut)
+DefaultDependencies=no
+Before=network-pre.target nut-server.service shutdown.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+# stays active in UPS Safe Mode
+IgnoreOnIsolate=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/synodeb-ups firewall
+ExecStop=-/usr/sbin/nft delete table inet synodeb_nut
+
+[Install]
+WantedBy=sysinit.target

@@ -1,0 +1,65 @@
+#!/bin/sh
+# synodeb installer, preseed/late_command: turns the freshly installed Debian into a
+# DS923+ system and points the DOM at it.
+#  1. synodeb apt repository (signed) and the Debian kernel pin;
+#  2. linux-image-ds923 + synology-ds923 (+ openssh-server);
+#  3. mdadm.conf: this system's arrays + "AUTO -all" (arrays of other systems, such as
+#     DSM's, are never assembled), then a new initramfs;
+#  4. synodeb-dom sync + setup: kernel and initrd on the DOM, DEBIAN entry with root=...
+#     as the default, installer entry and files removed.
+# Any failure stops here with an error in the installer and the DOM keeps booting DSM.
+set -e
+. /usr/lib/synodeb-installer/lib.sh
+T=/target
+step() { log "$*"; }
+fail() { log "FAILED: $*"; up ':' 3 3; exit 1; }
+# clean environment: with the installer's DEBIAN_HAS_FRONTEND & co. debconf in the chroot
+# would send its questions to the installer frontend, where nobody answers them
+chroot_run() {
+    chroot $T /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 \
+        DEBIAN_FRONTEND=noninteractive "$@" < /dev/null
+}
+
+repo=$(sed -n 's/.*synodeb\.repo=\([^ ]*\).*/\1/p' /proc/cmdline)
+step "apt repository ${repo:-https://rylos.github.io/synodeb/debian}"
+install -D -m 644 /usr/lib/synodeb-installer/synodeb-archive-keyring.gpg $T/usr/share/keyrings/synodeb-archive-keyring.gpg
+sed "s|^URIs: .*|URIs: ${repo:-https://rylos.github.io/synodeb/debian}|" /usr/lib/synodeb-installer/synodeb.sources \
+    > $T/etc/apt/sources.list.d/synodeb.sources
+install -D -m 644 /usr/lib/synodeb-installer/synodeb-no-debian-kernel $T/etc/apt/preferences.d/synodeb-no-debian-kernel
+
+# the DOM is reached from the chroot (blkid, mount): /dev, /proc, /sys, /run
+bound=
+for m in dev proc sys run; do
+    grep -q " $T/$m " /proc/mounts || { mount --bind /$m $T/$m && bound="$T/$m $bound"; }
+done
+
+step "installing the kernel and synology-ds923"
+chroot_run apt-get update >> $LOG 2>&1 || fail "apt-get update"
+# --force-confold: the apt source written above stays (it may point to another repository)
+chroot_run apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+    install linux-image-ds923 synology-ds923 openssh-server >> $LOG 2>&1 ||
+    fail "installing linux-image-ds923 synology-ds923"
+
+if [ -x $T/sbin/mdadm ] || [ -x $T/usr/sbin/mdadm ]; then
+    step "mdadm.conf: $(mdadm --detail --scan 2>/dev/null | wc -l) array(s)"
+    {
+        echo "# synodeb: arrays of this system; arrays of other systems (DSM) are never assembled"
+        echo "HOMEHOST <system>"
+        echo "MAILADDR root"
+        echo "AUTO -all"
+        mdadm --detail --scan 2>/dev/null
+    } > $T/etc/mdadm/mdadm.conf
+fi
+chroot_run update-initramfs -u -k all >> $LOG 2>&1 || fail "update-initramfs"
+
+step "DOM: kernel, initrd and boot entry"
+chroot_run synodeb-dom sync >> $LOG 2>&1 || fail "synodeb-dom sync"
+chroot_run synodeb-dom setup >> $LOG 2>&1 || fail "synodeb-dom setup"
+chroot_run synodeb-dom status >> $LOG 2>&1 || true
+
+for m in $bound; do umount $m 2>/dev/null || true; done
+mkdir -p $T/var/log
+cp $LOG $T/var/log/synodeb-installer.log 2>/dev/null || true
+step "done"
+up 8 3
+exit 0

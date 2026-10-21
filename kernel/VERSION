@@ -1,0 +1,6 @@
+# synodeb kernel: upstream version (kernel.org tarball) and ABI number.
+# The kernel is named <KVER>.0-<ABI>-ds923 (e.g. 7.3.0-1-ds923, package linux-image-7.3.0-1-ds923):
+# ABI is bumped on every published rebuild, so the previous kernel stays
+# installed next to the new one and serves as DEBIAN_OLD on the DOM.
+KVER=7.3
+ABI=1

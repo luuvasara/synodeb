@@ -1,0 +1,308 @@
+#!/bin/sh
+# synodeb-ups — UPS handling like DSM 7.4.1: when the battery runs low the NAS enters
+# "Safe Mode" instead of powering off.
+#
+#   synodeb-ups setup [--keep-password]   install the NUT configuration (/etc/nut) from the
+#                                         templates in /usr/share/synodeb/nut; random monuser
+#                                         password (or the one already set, with --keep-password)
+#   synodeb-ups passwd                    ask for the monuser password (e.g. Home Assistant: the
+#                                         same as DSM) and write it to upsd.users and upsmon.conf
+#   synodeb-ups status                    UPS and Safe Mode status
+#   synodeb-ups firewall                  nftables rules for upsd (synodeb-nut-firewall.service)
+#   events (from upssched, CMDSCRIPT):     onbatt online lowbatt nocomm fsd waittimeup
+#   safemode-shutdowncmd                   upsmon SHUTDOWNCMD (critical UPS: OB+LB, FSD,
+#                                          OB and then unreachable)
+#   safeloop                               inside synodeb-ups-safe.service
+#
+# Safe Mode (like DSM's UPS Safe Mode):
+#   isolate synodeb-ups-safe.target: all services stop except NUT, synohwd (fans,
+#   LEDs), network and ssh; data volumes are unmounted, / and /boot go read-only, SATA
+#   disks to standby; then the status is read every 10 s: 2 OL readings in a row -> reboot.
+#   The NAS NEVER powers off (no poweroff: the kernel does not send '1' to the microcontroller):
+#   if the UPS runs out, power is lost, and when mains power returns the
+#   microcontroller turns the NAS back on ('q', restore after power loss, sent by synohwd).
+#
+# Configuration: /etc/synodeb/ups.conf (DRYRUN, NOCOMM_SAFEMODE, SAFESHUTDOWN, UPS,
+# NETWORK_CLIENTS). Without NETWORK_CLIENTS upsd only listens on localhost.
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+CONF=${SYNODEB_UPS_CONF:-/etc/synodeb/ups.conf}
+TPL=/usr/share/synodeb/nut
+NOTIFY=/usr/lib/synodeb/notify
+RUN=/run/synodeb-ups
+SAFE=$RUN/safemode          # Safe Mode flag
+ONB=$RUN/onbatt             # on-battery flag
+REBOOTING=$RUN/rebooting
+# upsmon POWERDOWNFLAG (critical UPS): if it exists at shutdown, the Debian hook
+# /usr/lib/systemd/system-shutdown/nutshutdown powers the UPS off (upsdrvctl shutdown). DSM does
+# not (ups_safeshutdown=no) and this model has no shutdown.return: always remove it.
+KILLPOWER=/run/nut/killpower
+
+UPS=ups@localhost
+DRYRUN=0                    # 1: log what would be done, no isolate/umount/standby/reboot
+NOCOMM_SAFEMODE=onbatt      # onbatt | always (DSM) | never
+SAFESHUTDOWN=no             # yes: when the UPS is exhausted, ask it to power off (DSM ups_safeshutdown)
+NETWORK_CLIENTS=            # IPs allowed on upsd (port 3493), e.g. Home Assistant or another NAS
+LOOP_SECONDS=10
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+mkdir -p $RUN
+log() { logger -p daemon.warning -t synodeb-ups -- "$*" 2>/dev/null || echo "synodeb-ups: $*" >&2; }
+notify() { [ -x $NOTIFY ] && $NOTIFY "$@" >/dev/null 2>&1 || true; }
+run() {
+    if [ "$DRYRUN" = 1 ]; then log "DRYRUN: $*"; else "$@"; fi
+}
+# OL, OB (with or without LB) or ERR (upsd/driver unreachable, stale data)
+status() {
+    s=$(upsc "$UPS" ups.status 2>/dev/null) || { echo ERR; return; }
+    case " $s " in
+    *" OB "*) echo OB ;;
+    *" OL "*) echo OL ;;
+    *) echo ERR ;;
+    esac
+}
+var() { upsc "$UPS" "$1" 2>/dev/null; }
+statelog() {
+    log "$1: status=$(var ups.status) charge=$(var battery.charge)% runtime=$(var battery.runtime)s load=$(var ups.load)%"
+}
+
+safemode() { # $1 = reason
+    rm -f $KILLPOWER
+    [ -f $SAFE ] && return 0
+    case "$(systemctl is-system-running 2>/dev/null)" in
+    stopping) log "system already shutting down: ignoring ($1)"; return 0 ;;
+    esac
+    # like DSM: if boot is still in progress, wait (max 5 minutes)
+    i=0
+    while [ "$(systemctl is-system-running 2>/dev/null)" = starting ] && [ $i -lt 150 ]; do
+        sleep 2; i=$((i + 1))
+    done
+    if [ "$(status)" = OL ]; then
+        log "UPS back online: no Safe Mode ($1)"
+        return 0
+    fi
+    echo "$1 $(date '+%F %T')" > $SAFE
+    log "Safe Mode ($1): stopping services and unmounting volumes; the NAS stays on"
+    notify -f -p urgent "UPS: Safe Mode" "reason $1, battery $(var battery.charge)%, runtime $(var battery.runtime) s. Services stopped, volumes unmounted; reboot when power returns."
+    if [ "$DRYRUN" = 1 ]; then
+        log "DRYRUN: systemctl isolate synodeb-ups-safe.target (starting only synodeb-ups-safe.service)"
+        systemctl --no-block start synodeb-ups-safe.service
+    else
+        systemctl --no-block isolate synodeb-ups-safe.target
+    fi
+}
+
+reboot_now() { # $1 = reason
+    [ -f $REBOOTING ] && return 0
+    : > $REBOOTING
+    rm -f $KILLPOWER
+    log "power restored ($1): reboot"
+    notify -f -p high "UPS: power restored" "leaving Safe Mode with a reboot"
+    sleep 3
+    if [ "$DRYRUN" = 1 ]; then
+        log "DRYRUN: systemctl reboot"
+        rm -f $SAFE $REBOOTING $ONB         # the test can be repeated
+    else
+        systemctl reboot
+    fi
+}
+
+data_mounts() { # mount points on block devices except / and /boot, innermost first
+    findmnt -rn -o TARGET,SOURCE | awk '$2 ~ /^\/dev\// && $1 != "/" && $1 != "/boot" { print $1 }' | sort -r
+}
+
+safeloop() {
+    # isolate: wait for the services to stop (the stop jobs are not ordered against this one)
+    i=0
+    while [ $i -lt 120 ] && systemctl list-jobs --no-legend 2>/dev/null | grep -qv 'synodeb-ups-safe'; do
+        sleep 1; i=$((i + 1))
+    done
+    log "Safe Mode: services stopped; unmounting data volumes"
+    sync
+    if grep -q ' /mnt/dsm/' /proc/mounts && command -v synodeb-dsm >/dev/null; then
+        run synodeb-dsm umount
+    fi
+    for m in $(data_mounts); do
+        run umount "$m" || { log "umount $m failed: remounting read-only"; run mount -o remount,ro "$m"; }
+    done
+    sync
+    for m in /boot /; do
+        mountpoint -q $m && { run mount -o remount,ro $m || log "remount ro of $m failed"; }
+    done
+    # SATA disks to standby (like DSM); not USB disks
+    for b in /sys/block/sd*; do
+        [ -e "$b" ] || continue
+        case "$(readlink -f "$b/device")" in
+        */ata[0-9]*) run hdparm -y "/dev/${b##*/}" >/dev/null 2>&1 ;;
+        esac
+    done
+    log "Safe Mode active: checking the UPS every $LOOP_SECONDS s"
+    ol=0 exhausted=0
+    while :; do
+        sleep "$LOOP_SECONDS"
+        if [ "$(status)" = OL ]; then
+            ol=$((ol + 1))
+            [ $ol -lt 2 ] || { reboot_now "2 OL readings"; [ "$DRYRUN" = 1 ] && return 0; }
+        else
+            ol=0
+            exhausted=$((exhausted + 1))
+            if [ $exhausted = 2 ]; then
+                log "waiting for the UPS to run out (the NAS powers back on when mains power returns)"
+                if [ "$SAFESHUTDOWN" = yes ]; then
+                    for _ in 1 2 3; do run upsdrvctl shutdown && break; sleep 40; done
+                fi
+            fi
+        fi
+    done
+}
+
+online() { # like DSM, on power restore
+    if [ -f $ONB ]; then
+        rm -f $ONB
+        [ -f $SAFE ] || { log "UPS back online, no Safe Mode"; notify -p normal "UPS: power restored" "battery $(var battery.charge)%"; }
+    fi
+    [ -f $SAFE ] || return 0
+    # in Safe Mode: confirm with a second reading (like the loop) and reboot
+    sleep "$LOOP_SECONDS"
+    [ "$(status)" = OL ] && [ -f $SAFE ] && reboot_now "ONLINE event"
+    return 0
+}
+
+subst_password() { # $1 = password; writes upsd.users and upsmon.conf from the templates
+    umask 027
+    for f in upsd.users upsmon.conf; do
+        python3 -I -c 'import sys; t=open(sys.argv[1]).read(); open(sys.argv[2],"w").write(t.replace("__PASSWORD__", sys.argv[3]))' \
+            "$TPL/$f" "/etc/nut/$f.new" "$1"
+        chown root:nut "/etc/nut/$f.new" 2>/dev/null || true
+        chmod 640 "/etc/nut/$f.new"
+        mv "/etc/nut/$f.new" "/etc/nut/$f"
+    done
+}
+
+current_password() {
+    sed -n 's/^[[:space:]]*password[[:space:]]*=[[:space:]]*//p' /etc/nut/upsd.users 2>/dev/null | head -1
+}
+
+setup() {
+    [ -d /etc/nut ] || { echo "/etc/nut missing: install nut-server and nut-client" >&2; exit 1; }
+    pw=
+    [ "${1:-}" = --keep-password ] && pw=$(current_password)
+    case $pw in ''|__PASSWORD__) pw=$(head -c 18 /dev/urandom | base64 | tr -d '/+=') ;; esac
+    [ -f /etc/nut/.synodeb-orig.tar ] || tar -C /etc/nut -cf /etc/nut/.synodeb-orig.tar . 2>/dev/null || true
+    for f in nut.conf ups.conf upsd.conf upssched.conf; do
+        install -m 640 -o root -g nut "$TPL/$f" "/etc/nut/$f" 2>/dev/null || install -m 640 "$TPL/$f" "/etc/nut/$f"
+    done
+    subst_password "$pw"
+    # network clients (NETWORK_CLIENTS): upsd listens on all addresses, nftables does the filtering
+    if [ -n "$NETWORK_CLIENTS" ]; then
+        printf '%s\n' 'LISTEN 0.0.0.0 3493' 'LISTEN :: 3493' >> /etc/nut/upsd.conf
+    fi
+    echo "NUT configuration installed in /etc/nut (originals in /etc/nut/.synodeb-orig.tar)"
+    if u=$(usb_ups); then
+        systemctl enable nut.target nut-driver.target nut-server.service nut-monitor.service \
+            synodeb-nut-firewall.service >/dev/null 2>&1 || true
+        echo "USB UPS found ($u): NUT enabled"
+        echo "monuser password: for network clients set it with 'synodeb-ups passwd'"
+    else
+        # without a UPS the NUT driver would fail and restart forever (and notify each time)
+        systemctl disable nut.target nut-driver.target nut-server.service nut-monitor.service \
+            nut-driver-enumerator.path nut-driver-enumerator.service >/dev/null 2>&1 || true
+        [ ! -d /run/systemd/system ] || systemctl stop nut.target nut-driver.target 'nut-driver@*' \
+            nut-server.service nut-monitor.service >/dev/null 2>&1 || true
+        echo "no USB UPS connected: NUT stays off; connect the UPS and run 'synodeb-ups setup --keep-password'"
+    fi
+}
+
+# vendor:product of a connected USB UPS known to NUT (its udev rules list them), or failure
+usb_ups() {
+    rules=$(ls /usr/lib/udev/rules.d/*nut-usbups.rules /lib/udev/rules.d/*nut-usbups.rules 2>/dev/null | head -n 1)
+    [ -n "$rules" ] || return 1
+    for d in /sys/bus/usb/devices/*; do
+        [ -r "$d/idVendor" ] || continue
+        v=$(cat "$d/idVendor"); pr=$(cat "$d/idProduct")
+        if grep -q "ATTR{idVendor}==\"$v\", ATTR{idProduct}==\"$pr\"" "$rules"; then
+            echo "$v:$pr"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# nftables rules: upsd (3493) only from localhost and NETWORK_CLIENTS. Separate table,
+# does not touch Docker's rules or /etc/nftables.conf.
+firewall() {
+    v4=127.0.0.1 v6=::1
+    for ip in $NETWORK_CLIENTS; do
+        case $ip in *:*) v6="$v6, $ip" ;; *) v4="$v4, $ip" ;; esac
+    done
+    nft -f - <<EOT
+table inet synodeb_nut
+delete table inet synodeb_nut
+table inet synodeb_nut {
+	chain input {
+		type filter hook input priority filter - 10; policy accept;
+		tcp dport 3493 ip saddr { $v4 } accept
+		tcp dport 3493 ip6 saddr { $v6 } accept
+		tcp dport 3493 drop
+	}
+}
+EOT
+}
+
+passwd_cmd() {
+    printf 'monuser password (the same as the network clients, e.g. the one used under DSM): ' >&2
+    stty -echo 2>/dev/null; read -r pw; stty echo 2>/dev/null; echo >&2
+    [ -n "$pw" ] || { echo "empty password" >&2; exit 1; }
+    case $pw in *[[:space:]\"]*) echo "spaces and quotes not allowed" >&2; exit 1 ;; esac
+    subst_password "$pw"
+    systemctl try-restart nut-server.service nut-monitor.service || true
+    echo "password updated in /etc/nut/upsd.users and /etc/nut/upsmon.conf"
+}
+
+case "${1:-}" in
+setup) shift; setup "$@"; exit 0 ;;
+passwd) passwd_cmd; exit 0 ;;
+firewall) firewall; exit $? ;;
+status)
+    echo "UPS $UPS: $(var ups.status) (read: $(status)), battery $(var battery.charge)%, runtime $(var battery.runtime) s, load $(var ups.load)%"
+    if [ -f $SAFE ]; then echo "Safe Mode: active ($(cat $SAFE))"; else echo "Safe Mode: no"; fi
+    [ -f $ONB ] && echo "on battery since $(date -r $ONB '+%F %T')"
+    [ "$DRYRUN" = 1 ] && echo "DRYRUN=1 in $CONF: Safe Mode is only simulated"
+    exit 0 ;;
+safeloop) safeloop; exit 0 ;;
+esac
+
+# events: one at a time (like DSM)
+exec 9>$RUN/lock
+flock -x 9
+case "${1:-}" in
+onbatt)
+    statelog onbatt
+    if [ ! -f $ONB ]; then
+        : > $ONB
+        log "UPS on battery"
+        notify -p high "UPS on battery" "battery $(var battery.charge)%, runtime $(var battery.runtime) s"
+    fi ;;
+online) statelog online; online ;;
+lowbatt)
+    statelog lowbatt
+    [ "$(status)" = OL ] || notify -f -p urgent "UPS: battery low" "battery $(var battery.charge)%, runtime $(var battery.runtime) s: Safe Mode"
+    safemode lowbatt ;;
+nocomm)
+    # NOCOMM arrives after NOCOMMWARNTIME (300 s) without communication with the UPS. DSM always
+    # enters Safe Mode (even with a stuck driver and mains power present). Here by default only
+    # if the UPS was on battery; for OB + unreachable UPS upsmon calls
+    # SHUTDOWNCMD anyway after DEADTIME ("critical" UPS).
+    statelog nocomm
+    notify -p high "UPS unreachable" "no communication with $UPS for at least 5 minutes"
+    case $NOCOMM_SAFEMODE in
+    always) safemode nocomm ;;
+    onbatt) [ -f $ONB ] && safemode nocomm ;;
+    esac ;;
+fsd) statelog fsd; safemode fsd ;;
+waittimeup) statelog waittimeup; safemode waittimeup ;;
+safemode-shutdowncmd) statelog shutdowncmd; safemode shutdowncmd ;;
+*) sed -n '2,25p' "$0" >&2; exit 2 ;;
+esac
+exit 0

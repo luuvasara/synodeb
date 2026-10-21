@@ -1,0 +1,30 @@
+diff --git a/drivers/leds/Kconfig b/drivers/leds/Kconfig
+index d0d318223..ac61ec363 100644
+--- a/drivers/leds/Kconfig
++++ b/drivers/leds/Kconfig
+@@ -120,6 +120,13 @@ config LEDS_OSRAM_AMS_AS3668
+ 	  To compile this driver as a module, choose M here: the module
+ 	  will be called leds-as3668.
+ 
++config LEDS_ATMEGA1608
++	tristate "LED support for the Synology ATmega1608 disk LED controller"
++	depends on LEDS_CLASS && I2C
++	help
++	  The ATmega1608 microcontroller that drives the green/orange disk
++	  LEDs of Synology NAS such as the DS923+ (I2C address 0x60).
++
+ config LEDS_AW200XX
+ 	tristate "LED support for Awinic AW20036/AW20054/AW20072/AW20108"
+ 	depends on LEDS_CLASS
+diff --git a/drivers/leds/Makefile b/drivers/leds/Makefile
+index a68244bd5..92923b546 100644
+--- a/drivers/leds/Makefile
++++ b/drivers/leds/Makefile
+@@ -16,6 +16,7 @@ obj-$(CONFIG_LEDS_AN30259A)		+= leds-an30259a.o
+ obj-$(CONFIG_LEDS_APU)			+= leds-apu.o
+ obj-$(CONFIG_LEDS_ARIEL)		+= leds-ariel.o
+ obj-$(CONFIG_LEDS_OSRAM_AMS_AS3668)	+= leds-as3668.o
++obj-$(CONFIG_LEDS_ATMEGA1608)		+= leds-atmega1608.o
+ obj-$(CONFIG_LEDS_AW200XX)		+= leds-aw200xx.o
+ obj-$(CONFIG_LEDS_AW2013)		+= leds-aw2013.o
+ obj-$(CONFIG_LEDS_BCM6328)		+= leds-bcm6328.o

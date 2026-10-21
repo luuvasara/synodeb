@@ -1,0 +1,57 @@
+#!/bin/sh
+# Kernel trial (see synodeb-dom): when the DEBIAN entry boots while EFI/boot/synodeb-trial
+# is on the DOM, DEBIAN_OLD becomes the default before anything can go wrong. If this boot
+# hangs or panics (panic=30) the next one starts the previous kernel; if it succeeds
+# synodeb-boot-ok.service makes DEBIAN the default again. A normal boot reads the DOM
+# only, and an error here never stops the boot.
+PREREQ="udev"
+prereqs() { echo "$PREREQ"; }
+case "$1" in prereqs) prereqs; exit 0 ;; esac
+. /scripts/functions
+case " $(cat /proc/cmdline) " in *" synodeb.entry=DEBIAN "*) ;; *) exit 0 ;; esac
+
+DOM=10EE-589C
+MNT=/run/synodeb-dom
+CONF=$MNT/EFI/boot/SynoBootLoader.conf
+TRIAL=$MNT/EFI/boot/synodeb-trial
+
+modprobe vfat 2>/dev/null; modprobe nls_cp437 2>/dev/null; modprobe nls_ascii 2>/dev/null
+
+# index of the DEBIAN_OLD menu entry (GRUB counts from 0)
+old_index() {
+    n=0
+    while IFS= read -r l; do
+        case "$l" in
+        *menuentry\ \"DEBIAN_OLD\"*) echo $n; return ;;
+        *menuentry\ *) n=$((n + 1)) ;;
+        esac
+    done < "$CONF"
+}
+
+i=0
+while [ $i -lt 20 ]; do           # the DOM is a USB device: give it a few seconds
+    dev=$(blkid -U $DOM 2>/dev/null)
+    [ -n "$dev" ] && break
+    sleep 1; i=$((i + 1))
+done
+[ -n "$dev" ] || exit 0
+mkdir -p $MNT
+mount -t vfat -o ro "$dev" $MNT 2>/dev/null || exit 0
+if [ ! -f "$TRIAL" ]; then
+    umount $MNT
+    exit 0
+fi
+n=$(old_index)
+umount $MNT
+[ -n "$n" ] || exit 0
+mount -t vfat "$dev" $MNT 2>/dev/null || exit 0
+if sed "s/^set default='[0-9]*'/set default='$n'/" "$CONF" > "$CONF.tmp" &&
+   grep -q "^set default='$n'" "$CONF.tmp" && mv -f "$CONF.tmp" "$CONF"; then
+    log_success_msg "synodeb: new kernel on trial, DEBIAN_OLD is the default until the boot is confirmed"
+else
+    log_warning_msg "synodeb: could not arm the kernel trial on the DOM"
+fi
+rm -f "$CONF.tmp"
+sync
+umount $MNT
+exit 0

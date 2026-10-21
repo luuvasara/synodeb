@@ -1,0 +1,18 @@
+[Unit]
+Description=synodeb: boot succeeded (network and ssh up), Debian becomes the default DOM entry again
+Wants=network-online.target
+After=network-online.target ssh.service ssh.socket
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# waits up to 5 minutes for network and ssh; if they do not come up, DSM stays for the next boot
+ExecStart=/usr/sbin/synodeb-dom boot-ok --wait
+# "boot completed" notification (also reports if the previous boot ended badly); on a clean
+# shutdown removes the marker /var/lib/synodeb/running
+ExecStartPost=-/usr/lib/synodeb/boot-report start
+ExecStop=-/usr/lib/synodeb/boot-report stop
+TimeoutStartSec=10min
+
+[Install]
+WantedBy=multi-user.target

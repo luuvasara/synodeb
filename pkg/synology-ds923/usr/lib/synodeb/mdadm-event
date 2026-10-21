@@ -1,0 +1,11 @@
+#!/bin/sh
+# PROGRAM for mdadm --monitor (mdadm.conf): $1 event, $2 array, $3 component (if any).
+# Informational events (NewArray, RebuildStarted, RebuildNN...) stay in the journal.
+ev=${1:-?} md=${2:-?} dev=${3:-}
+case "$ev" in
+Fail|FailSpare|DegradedArray|DeviceDisappeared) prio=urgent ;;
+SparesMissing|MoveSpare|SpareActive|RebuildFinished|TestMessage) prio=normal ;;
+*) logger -t synodeb-notify -- "mdadm: $ev $md $dev" 2>/dev/null; exit 0 ;;
+esac
+/usr/lib/synodeb/notify -p $prio "RAID $md: $ev${dev:+ ($dev)}" "$(cat /proc/mdstat 2>/dev/null)"
+exit 0

@@ -1,0 +1,13 @@
+[Unit]
+Description=synodeb: M.2 SSD power limit like DSM (14.85 W / 9.9 W)
+After=systemd-modules-load.service local-fs.target
+ConditionPathExistsGlob=/sys/class/nvme/nvme*
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# leading "-": an error does not mark the unit failed and does not affect the boot
+ExecStart=-/usr/lib/synodeb/nvme-power-limit
+
+[Install]
+WantedBy=multi-user.target

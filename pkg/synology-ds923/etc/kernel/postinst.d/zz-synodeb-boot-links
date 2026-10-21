@@ -1,0 +1,37 @@
+#!/bin/sh
+# The Synology GRUB on the DOM boots /vmlinuz and /initrd.img (DEBIAN entry) and
+# /vmlinuz.old and /initrd.img.old (DEBIAN_OLD entry) from the SYNODEB_BOOT partition.
+# They point to the newest and the previous kernel among those in /boot.
+# No set -e: a missing file must not stop the rest (symlinks and copy to the DOM).
+set -u
+cd /boot || exit 0
+kernels=$(ls vmlinuz-* 2>/dev/null | sed 's/^vmlinuz-//' | sort -V | tac)
+new=$(echo "$kernels" | sed -n 1p)
+old=$(echo "$kernels" | sed -n 2p)
+[ -n "$old" ] || old=$new
+for v in $new $old; do
+    # postinst.d runs before the initrd of a new kernel exists: create it here
+    if [ ! -f "initrd.img-$v" ] && [ "$v" = "${1:-}" ]; then
+        update-initramfs -c -k "$v" >/dev/null || echo "synodeb: update-initramfs -c -k $v failed" >&2
+    fi
+done
+link() { # name target
+    if [ -n "$2" ] && [ -e "$2" ]; then
+        ln -sfn "$2" "$1.tmp" && mv -Tf "$1.tmp" "$1" || echo "synodeb: symlink /boot/$1 not updated" >&2
+    else
+        echo "synodeb: /boot/${2:-?} missing, /boot/$1 unchanged" >&2
+    fi
+}
+if [ -n "$new" ]; then
+    link vmlinuz "vmlinuz-$new"
+    link initrd.img "initrd.img-$new"
+    link vmlinuz.old "vmlinuz-$old"
+    link initrd.img.old "initrd.img-$old"
+    echo "synodeb: DEBIAN -> $new, DEBIAN_OLD -> $old"
+fi
+# The DOM GRUB boots the copy in synoboot2:/synodeb (the firmware always boots from the DOM).
+# Not while building the image (chroot).
+if ! ischroot -t 2>/dev/null && blkid -U 45e5b07d-4783-4867-a369-f99c0cd1e610 >/dev/null 2>&1; then
+    /usr/sbin/synodeb-dom sync || echo "synodeb: copy to the DOM failed" >&2
+fi
+exit 0

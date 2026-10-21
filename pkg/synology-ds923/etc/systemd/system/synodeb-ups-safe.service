@@ -1,0 +1,7 @@
+[Unit]
+Description=UPS Safe Mode: unmount volumes, disks to standby, reboot when power returns
+After=basic.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/synodeb-ups safeloop

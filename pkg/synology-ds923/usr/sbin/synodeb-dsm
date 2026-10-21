@@ -1,0 +1,299 @@
+#!/bin/bash
+# READ-ONLY access to the DSM data volumes (DS923+ disks and NVMe).
+#   synodeb-dsm status
+#   synodeb-dsm mount [--key-file FILE] [--allow-degraded] [volume1 volume2 ...]
+#   synodeb-dsm umount
+# DSM layout: md0/md1 raid1 superblock 0.90 = DSM system and swap (NEVER touched);
+# data arrays (md2+, superblock 1.x) on the disks (sdX5) or NVMe (nvmeXn1p3) -> LVM
+# vgN/volume_N -> btrfs or ext4 (volumeN), optionally LUKS2-encrypted. A btrfs volume may
+# carry a Synology compat_ro flag: mainline mounts it read-only only. DSM's "cachedev_*"
+# flashcache in DUMMY mode is skipped here and the LVM volume is used directly.
+# Everything read-only, no writes to the disks:
+#  - arrays: mdadm --assemble --readonly (never degraded without confirmation) with --uuid read from
+#    the members' superblocks (not --scan); refuses if an array is already active read-write;
+#  - LVM: metadata_read_only=1 and read_only_volume_list (no metadata changes,
+#    volumes activated ro); --devices restricts LVM to the arrays just assembled;
+#  - LUKS: cryptsetup open --readonly; btrfs: ro,rescue=nologreplay; ext4: ro,noload.
+# Key of an encrypted volume: --key-file, else KEY_FILE (default /root/NAS_Volume1.rkey, the
+# recovery key file exported by DSM) if it exists, else cryptsetup asks for it interactively.
+# Optional configuration: /etc/synodeb/dsm.conf (MOUNT_BASE, KEY_FILE, MD_UUIDS).
+set -euo pipefail
+export LC_ALL=C LVM_SUPPRESS_FD_WARNINGS=1
+
+MOUNT_BASE=/mnt/dsm
+KEY_FILE=/root/NAS_Volume1.rkey
+MD_UUIDS=""            # if not empty: only these arrays (mdadm UUIDs, space separated)
+DSM_DEVICES=""         # extra candidate devices (testing: loop devices)
+# shellcheck source=/dev/null
+[ -r /etc/synodeb/dsm.conf ] && . /etc/synodeb/dsm.conf
+RUN=/run/synodeb-dsm
+STATE=$RUN/state
+LVM_RO='global { metadata_read_only = 1 }'
+
+die() {
+    echo "synodeb-dsm: $*" >&2
+    [ ! -s "${STATE:-/nonexistent}" ] || echo "synodeb-dsm: partially activated: run 'synodeb-dsm umount' to deactivate" >&2
+    exit 1
+}
+say() { echo "synodeb-dsm: $*"; }
+usage() { sed -n '2,5p' "$0" >&2; exit 2; }
+[ "$(id -u)" = 0 ] || die "must be run as root"
+
+mkdir -p $RUN
+chmod 700 $RUN
+exec 9>$RUN/lock
+flock -w 30 9 || die "another synodeb-dsm is running"
+
+# --- md arrays --------------------------------------------------------------------------
+# UUIDs of the arrays defined in mdadm.conf (Debian arrays: never treated as DSM)
+debian_uuids() {
+    sed -n 's/.*[[:space:]]UUID=\([0-9a-fA-F:]*\).*/\1/p' /etc/mdadm/mdadm.conf /etc/mdadm/mdadm.conf.d/*.conf 2>/dev/null || true
+}
+# "uuid level n_devices name member" lines from the superblocks (metadata 1.x only)
+scan_members() {
+    local dev line md_meta md_uuid md_level md_devs md_name
+    local deb
+    deb=" $(debian_uuids | tr '\n' ' ') "
+    {
+        lsblk -rnpo NAME,TYPE | awk '$2 == "part" { print $1 }'
+        for d in $DSM_DEVICES; do echo "$d"; done
+    } | while read -r dev; do
+        md_meta='' md_uuid='' md_level='' md_devs='' md_name=''
+        while IFS='=' read -r k v; do
+            case $k in
+            MD_UUID) md_uuid=$v ;;
+            MD_LEVEL) md_level=$v ;;
+            MD_DEVICES) md_devs=$v ;;
+            MD_NAME) md_name=$v ;;
+            esac
+        done < <(mdadm --examine --export "$dev" 2>/dev/null || true)
+        [ -n "$md_uuid" ] || continue
+        # --examine --export does not report the superblock version: read it from the text output
+        md_meta=$(mdadm --examine "$dev" 2>/dev/null | sed -n 's/^ *Version : //p' | head -n 1)
+        case $md_meta in 1.*) ;; *) continue ;; esac     # 0.90 = DSM system md0/md1
+        case "$deb" in *" $md_uuid "*) continue ;; esac
+        if [ -n "$MD_UUIDS" ]; then
+            case " $MD_UUIDS " in *" $md_uuid "*) ;; *) continue ;; esac
+        fi
+        line="$md_uuid $md_level $md_devs ${md_name:-?} $dev"
+        echo "$line"
+    done
+}
+# active /dev/mdN with that UUID (empty if none)
+active_md() {
+    local s u
+    for s in /sys/block/md*/md; do
+        [ -d "$s" ] || continue
+        u=$(mdadm --detail --export "/dev/$(basename "${s%/md}")" 2>/dev/null | sed -n 's/^MD_UUID=//p')
+        [ "$u" = "$1" ] && { echo "/dev/$(basename "${s%/md}")"; return; }
+    done
+    return 0
+}
+md_state() { cat "/sys/block/$(basename "$1")/md/array_state" 2>/dev/null || echo '?'; }
+
+# --- saved state ------------------------------------------------------------------------
+# lines: "md <dev> <uuid>", "lv <vg/lv>", "crypt <name>", "mnt <dir>"
+record() { echo "$*" >> $STATE; }
+
+# LUKS key: try the file as is, without the trailing newline, and base64-decoded
+open_luks() { # device name
+    local dev=$1 name=$2 kf=${OPT_KEY:-} k ok=''
+    if [ -z "$kf" ] && [ -f "$KEY_FILE" ]; then kf=$KEY_FILE; fi
+    if [ -z "$kf" ]; then
+        say "no key file: cryptsetup asks for the passphrase / recovery key"
+        cryptsetup open --readonly --type luks "$dev" "$name"
+        return
+    fi
+    [ -r "$kf" ] || die "key file $kf not readable"
+    umask 077
+    cp "$kf" $RUN/key.raw
+    tr -d '\r\n' < "$kf" > $RUN/key.trim
+    if tr -d '\r\n \t' < "$kf" | grep -qE '^[A-Za-z0-9+/=_-]+$'; then
+        tr -d '\r\n \t' < "$kf" | tr '_-' '/+' | base64 -d > $RUN/key.b64 2>/dev/null || rm -f $RUN/key.b64
+    fi
+    for k in raw trim b64; do
+        [ -s $RUN/key.$k ] || continue
+        if cryptsetup open --test-passphrase --type luks --key-file $RUN/key.$k "$dev" 2>/dev/null; then
+            ok=$k; break
+        fi
+    done
+    if [ -z "$ok" ]; then
+        rm -f $RUN/key.*
+        die "$kf does not open $dev (tried: whole file, without newline, base64-decoded)"
+    fi
+    case $ok in
+    raw) say "key: $kf used as is" ;;
+    trim) say "key: $kf without the trailing newline (text)" ;;
+    b64) say "key: $kf base64-decoded ($(stat -c %s $RUN/key.b64) bytes)" ;;
+    esac
+    cryptsetup open --readonly --type luks --key-file $RUN/key.$ok "$dev" "$name" || { rm -f $RUN/key.*; die "cryptsetup open $dev failed"; }
+    rm -f $RUN/key.*
+}
+
+mount_fs() { # device directory
+    local dev=$1 dir=$2 t
+    t=$(blkid -p -s TYPE -o value "$dev" 2>/dev/null || true)
+    mkdir -p "$dir"
+    mountpoint -q "$dir" && die "$dir is already a mount point"
+    case $t in
+    btrfs)
+        # subvolume @syno = the root DSM mounts on /volumeN; if missing, the top level
+        mount -t btrfs -o ro,rescue=nologreplay,subvol=@syno "$dev" "$dir" 2>/dev/null ||
+            mount -t btrfs -o ro,rescue=nologreplay "$dev" "$dir" ;;
+    ext4|ext3|ext2) mount -t "$t" -o ro,noload "$dev" "$dir" ;;
+    "") die "$dev: unrecognised filesystem" ;;
+    *) mount -t "$t" -o ro "$dev" "$dir" ;;
+    esac
+    record mnt "$dir"
+    say "$dir <- $dev ($t, read-only)"
+}
+
+do_mount() {
+    local want=("$@") line lines uuid level ndev name devs count md vgs vg lv dm t vol dir mds=()
+    { command -v mdadm && command -v lvm; } >/dev/null || die "mdadm and lvm2 are required"
+    lines=$(scan_members | sort)
+    [ -n "$lines" ] || die "no DSM array member (md 1.x superblock) found"
+    # refuse up front: a DSM array already active read-write
+    for uuid in $(echo "$lines" | awk '{print $1}' | sort -u); do
+        md=$(active_md "$uuid")
+        [ -z "$md" ] && continue
+        case $(md_state "$md") in
+        readonly) ;;
+        *) die "$md (UUID $uuid) is already assembled read-write ($(md_state "$md")): touching nothing" ;;
+        esac
+    done
+    for uuid in $(echo "$lines" | awk '{print $1}' | sort -u); do
+        level=$(echo "$lines" | awk -v u="$uuid" '$1 == u { print $2; exit }')
+        ndev=$(echo "$lines" | awk -v u="$uuid" '$1 == u { print $3; exit }')
+        name=$(echo "$lines" | awk -v u="$uuid" '$1 == u { print $4; exit }')
+        mapfile -t devs < <(echo "$lines" | awk -v u="$uuid" '$1 == u { print $5 }')
+        count=${#devs[@]}
+        md=$(active_md "$uuid")
+        if [ -n "$md" ]; then
+            say "$md ($name, $level) already active read-only"
+        else
+            local extra=()
+            if [ "$count" -lt "$ndev" ]; then
+                if [ -z "${OPT_DEGRADED:-}" ] || [ "$level" = raid0 ]; then
+                    die "array $name ($level, UUID $uuid): found $count of $ndev members; not assembling it (--allow-degraded for a degraded raid1/5/6)"
+                fi
+                read -r -p "array $name ($level) DEGRADED: $count/$ndev members. Assemble read-only? Type YES: " ans
+                [ "$ans" = YES ] || die "cancelled"
+                extra=(--run)
+            fi
+            md=/dev/md/dsm-${name##*:}
+            [ ! -e "$md" ] || die "$md already exists"
+            say "assembling $md ($name, $level, $count/$ndev: ${devs[*]}) read-only"
+            mdadm --assemble "$md" --config=none --readonly "${extra[@]}" --uuid="$uuid" "${devs[@]}"
+            md=$(readlink -f "$md")
+            record md "$md" "$uuid"
+            if [ "$(md_state "$md")" != readonly ]; then
+                mdadm --stop "$md" || true
+                die "$md is not read-only ($(md_state "$md")): stopped"
+            fi
+            # a dropped member (stale superblock) leaves the array degraded
+            if [ "$(cat "/sys/block/${md##*/}/md/degraded" 2>/dev/null || echo 0)" != 0 ] && [ -z "${OPT_DEGRADED:-}" ]; then
+                mdadm --stop "$md" || true
+                die "$md started degraded (stale members?): stopped; --allow-degraded to use it"
+            fi
+        fi
+        blockdev --setro "$md"
+        mds+=("$md")
+    done
+    # LVM only on the DSM arrays, metadata read-only
+    vgs=$(lvm pvs --devices "$(IFS=,; echo "${mds[*]}")" --config "$LVM_RO" --noheadings -o vg_name 2>/dev/null | awk 'NF' | sort -u)
+    [ -n "$vgs" ] || die "no LVM volume group on arrays ${mds[*]}"
+    for vg in $vgs; do
+        # a Debian VG with the same name would make /dev/<vg> ambiguous
+        if lvm vgs --noheadings -o vg_name 2>/dev/null | awk -v v="$vg" '$1 == v { n++ } END { exit !(n > 1) }'; then
+            die "several LVM volume groups named $vg: activating nothing"
+        fi
+    done
+    local devlist cfg
+    devlist=$(IFS=,; echo "${mds[*]}")
+    cfg="$LVM_RO activation { read_only_volume_list = [ $(for vg in $vgs; do printf '"%s",' "$vg"; done | sed 's/,$//') ] }"
+    local lvl
+    mapfile -t lvl < <(lvm lvs --devices "$devlist" --config "$LVM_RO" --noheadings -o vg_name,lv_name 2>/dev/null)
+    for line in "${lvl[@]}"; do
+        read -r vg lv <<< "$line"
+        [ -n "$lv" ] || continue
+        case $lv in syno_vg_reserved_area) continue ;; esac
+        vol=volume${lv##*_}
+        if [ ${#want[@]} -gt 0 ] && [[ " ${want[*]} " != *" $vol "* ]]; then continue; fi
+        dm=/dev/$vg/$lv
+        if [ -e "$dm" ]; then
+            [ "$(blockdev --getro "$dm")" = 1 ] || die "$dm is already active read-write: touching nothing"
+        else
+            lvm lvchange -ay --devices "$devlist" --config "$cfg" "$vg/$lv"
+            record lv "$vg/$lv" "$devlist"
+            udevadm settle
+            [ "$(blockdev --getro "$dm")" = 1 ] || { lvm lvchange -an --devices "$devlist" --config "$LVM_RO" "$vg/$lv"; die "$dm is not read-only: deactivated"; }
+        fi
+        dir=$MOUNT_BASE/$vol
+        t=$(blkid -p -s TYPE -o value "$dm" 2>/dev/null || true)
+        if [ "$t" = crypto_LUKS ]; then
+            local cn=dsm-$vg-$lv
+            if [ ! -e "/dev/mapper/$cn" ]; then
+                open_luks "$dm" "$cn"
+                record crypt "$cn"
+            fi
+            [ "$(blockdev --getro "/dev/mapper/$cn")" = 1 ] || die "/dev/mapper/$cn is not read-only"
+            dm=/dev/mapper/$cn
+        fi
+        if mountpoint -q "$dir"; then say "$dir already mounted"; continue; fi
+        mount_fs "$dm" "$dir"
+    done
+}
+
+do_umount() {
+    local kind a b
+    [ -s $STATE ] || { say "nothing to unmount (no state in $STATE)"; return 0; }
+    # undo last-first: mount, crypt, lv, md
+    tac $STATE | while read -r kind a b; do
+        case $kind in
+        mnt) if mountpoint -q "$a"; then umount "$a" && say "unmounted $a"; fi; rmdir "$a" 2>/dev/null || true ;;
+        crypt) if [ -e "/dev/mapper/$a" ]; then cryptsetup close "$a" && say "closed $a"; fi ;;
+        lv) if [ -e "/dev/$a" ]; then lvm lvchange -an --devices "$b" --config "$LVM_RO" "$a" && say "deactivated $a"; fi ;;
+        md) if [ -e "$a" ] && [ "$(mdadm --detail --export "$a" 2>/dev/null | sed -n 's/^MD_UUID=//p')" = "$b" ]; then
+                mdadm --stop "$a" && say "stopped $a"
+            fi ;;
+        esac
+    done
+    rm -f $STATE
+}
+
+do_status() {
+    local lines uuid md
+    echo "== DSM array members (md 1.x superblock; md0/md1 0.90 excluded)"
+    lines=$(scan_members | sort)
+    if [ -z "$lines" ]; then echo "  none"; fi
+    for uuid in $(echo "$lines" | awk '{print $1}' | sort -u); do
+        md=$(active_md "$uuid")
+        echo "$lines" | awk -v u="$uuid" '$1 == u { n++; l=$2; d=$3; nm=$4; m = m " " $5 } END { printf "  %s %s %s members %d/%d:%s\n", nm, l, u, n, d, m }'
+        echo "    ${md:-not assembled}${md:+ state $(md_state "$md")}"
+    done
+    echo "== /proc/mdstat"; sed 's/^/  /' /proc/mdstat
+    if [ -s $STATE ]; then echo "== activated by synodeb-dsm"; sed 's/^/  /' $STATE; fi
+    echo "== dm"; dmsetup info -c --noheadings -o name,attr 2>/dev/null | sed 's/^/  /' || true
+    echo "== mounts under $MOUNT_BASE"; findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS | awk -v b="$MOUNT_BASE" 'index($1, b) == 1 { print "  " $0 }'
+}
+
+cmd=${1:-status}
+[ $# -eq 0 ] || shift
+OPT_KEY='' OPT_DEGRADED='' VOLS=()
+while [ $# -gt 0 ]; do
+    case $1 in
+    --key-file) [ $# -ge 2 ] || usage; OPT_KEY=$2; shift ;;
+    --key-file=*) OPT_KEY=${1#*=} ;;
+    --allow-degraded) OPT_DEGRADED=1 ;;
+    volume[0-9]*) VOLS+=("$1") ;;
+    *) usage ;;
+    esac
+    shift
+done
+case $cmd in
+mount) trap 'rm -f $RUN/key.*' EXIT; do_mount "${VOLS[@]}"; do_status | sed -n '/^== mount/,$p' ;;
+umount|unmount) do_umount ;;
+status) do_status ;;
+*) usage ;;
+esac

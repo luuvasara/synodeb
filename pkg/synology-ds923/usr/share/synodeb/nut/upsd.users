@@ -1,0 +1,5 @@
+# synodeb (synodeb-ups setup). Same user as DSM: for network clients (e.g. Home Assistant,
+# other NAS) set the password with 'synodeb-ups passwd' (also writes upsmon.conf).
+[monuser]
+	password = __PASSWORD__
+	upsmon primary

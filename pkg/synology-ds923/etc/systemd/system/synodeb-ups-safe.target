@@ -1,0 +1,11 @@
+# UPS Safe Mode (like DSM's safe-shutdown.target): services stopped, volumes unmounted, NAS on.
+# Reached via 'systemctl isolate' from /usr/sbin/synodeb-ups; basic.target stays active
+# along with units that have IgnoreOnIsolate=yes (NUT, synohwd, network, ssh: synodeb-ups.conf drop-ins).
+[Unit]
+Description=UPS Safe Mode (like DSM)
+Requires=basic.target
+Wants=synodeb-ups-safe.service
+# nut-server has Requires=network.target: without these, isolate would stop upsd too
+Wants=network.target network-online.target
+After=basic.target
+AllowIsolate=yes

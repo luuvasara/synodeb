@@ -1,0 +1,107 @@
+#!/bin/sh
+# Single synodeb notifier: smartd, mdadm, synohwd, failed units, boot completed.
+#   /usr/lib/synodeb/notify [-p low|normal|high|urgent] [-f] TITLE [MESSAGE|-]
+#     -p  priority (default normal); messages below MIN_PRIORITY are dropped
+#     -f  send even if the same message went out recently (repeat suppression)
+#     -   read the message from standard input
+# Backends in /etc/synodeb/notify.conf: email (msmtp), Telegram, ntfy. With no backend
+# configured it only writes to the journal. Exits 0 if at least one backend worked (or there
+# are none), 1 if all configured ones failed: callers ignore it.
+set -u
+CONF=${SYNODEB_NOTIFY_CONF:-/etc/synodeb/notify.conf}
+STATE=/run/synodeb/notify
+
+prio=normal force=0
+while getopts p:f o; do
+    case $o in
+    p) prio=$OPTARG ;;
+    f) force=1 ;;
+    *) sed -n '3,6p' "$0" >&2; exit 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || { sed -n '3,6p' "$0" >&2; exit 2; }
+title=$1
+msg=${2:-}
+[ "$msg" != - ] || msg=$(head -c 3500)
+
+rank() { case $1 in low) echo 1 ;; high) echo 3 ;; urgent) echo 4 ;; *) echo 2 ;; esac; }
+
+# defaults (notify.conf overrides them)
+MIN_PRIORITY=normal
+REPEAT_MINUTES=30
+EMAIL_TO='' EMAIL_FROM='' SMTP_HOST='' SMTP_PORT=587 SMTP_TLS=starttls
+SMTP_USER='' SMTP_PASSWORD_FILE=''
+TELEGRAM_TOKEN='' TELEGRAM_CHAT_ID=''
+NTFY_URL='' NTFY_TOKEN=''
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+host=$(hostname 2>/dev/null || echo nas)
+logger -t synodeb-notify -p "user.$(case $prio in low) echo info ;; normal) echo notice ;; high) echo warning ;; *) echo crit ;; esac)" \
+    -- "[$prio] $title${msg:+: $msg}" 2>/dev/null || true
+[ "$(rank "$prio")" -ge "$(rank "$MIN_PRIORITY")" ] || exit 0
+[ -n "$EMAIL_TO$TELEGRAM_TOKEN$NTFY_URL" ] || exit 0
+
+# repeat suppression: same title+message within REPEAT_MINUTES -> not sent again
+mkdir -p "$STATE" 2>/dev/null
+key=$(printf '%s\n%s' "$title" "$msg" | md5sum | cut -c1-16)
+if [ "$force" = 0 ] && [ -n "$(find "$STATE/$key" -mmin "-$REPEAT_MINUTES" 2>/dev/null)" ]; then
+    logger -t synodeb-notify -- "already sent in the last $REPEAT_MINUTES minutes: $title" 2>/dev/null || true
+    exit 0
+fi
+
+subject="[$host] $title"
+ok=0 tried=0
+
+if [ -n "$EMAIL_TO" ] && [ -n "$SMTP_HOST" ]; then
+    tried=1
+    set -- --host="$SMTP_HOST" --port="$SMTP_PORT" --timeout=20 --from="${EMAIL_FROM:-root@$host}"
+    case $SMTP_TLS in
+    starttls) set -- "$@" --tls=on --tls-starttls=on ;;
+    tls|smtps) set -- "$@" --tls=on --tls-starttls=off ;;
+    *) set -- "$@" --tls=off ;;
+    esac
+    if [ -n "$SMTP_USER" ]; then
+        set -- "$@" --auth=on --user="$SMTP_USER"
+        [ -z "$SMTP_PASSWORD_FILE" ] || set -- "$@" --passwordeval="cat $SMTP_PASSWORD_FILE"
+    fi
+    # shellcheck disable=SC2086
+    if printf 'From: %s\nTo: %s\nSubject: %s\nX-Priority: %s\nContent-Type: text/plain; charset=UTF-8\n\n%s\n\n-- \nsynodeb %s\n' \
+        "${EMAIL_FROM:-root@$host}" "$EMAIL_TO" "$subject" "$prio" "$msg" "$(date '+%F %T')" |
+        msmtp "$@" -- $EMAIL_TO; then
+        ok=1
+    else
+        logger -t synodeb-notify -- "email failed" 2>/dev/null || true
+    fi
+fi
+
+if [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+    tried=1
+    if curl -fsS --max-time 20 -o /dev/null "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" \
+        --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
+        --data-urlencode "text=$subject${msg:+
+$msg}" \
+        -d disable_notification="$([ "$(rank "$prio")" -le 1 ] && echo true || echo false)"; then
+        ok=1
+    else
+        logger -t synodeb-notify -- "telegram failed" 2>/dev/null || true
+    fi
+fi
+
+if [ -n "$NTFY_URL" ]; then
+    tried=1
+    np=$(case $prio in low) echo 2 ;; high) echo 4 ;; urgent) echo 5 ;; *) echo 3 ;; esac)
+    # title and priority as URL parameters: HTTP headers do not handle UTF-8
+    if printf '%s' "${msg:-$title}" | curl -fsS --max-time 20 -o /dev/null \
+        --url-query "title=$subject" --url-query "priority=$np" --url-query "tags=synodeb" \
+        ${NTFY_TOKEN:+-H "Authorization: Bearer $NTFY_TOKEN"} \
+        --data-binary @- "$NTFY_URL"; then
+        ok=1
+    else
+        logger -t synodeb-notify -- "ntfy failed" 2>/dev/null || true
+    fi
+fi
+
+[ "$ok" = 1 ] && : > "$STATE/$key" 2>/dev/null
+[ "$tried" = 0 ] || [ "$ok" = 1 ]

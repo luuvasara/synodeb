@@ -1,0 +1,7 @@
+# synodeb — boot entries on the Synology DOM (written by 'synodeb-dom setup').
+# After a change run: synodeb-dom setup
+#
+# Root filesystem for the kernel command line (root=...). Empty: taken from /etc/fstab.
+ROOT=""
+# Extra kernel parameters, e.g. "synology_ds923.spinup_delay=8".
+CMDLINE=""

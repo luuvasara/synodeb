@@ -1,0 +1,6 @@
+# synodeb: kernel for the Synology DS923+ and the synology-ds923 package
+Types: deb
+URIs: https://rylos.github.io/synodeb/debian
+Suites: trixie
+Components: main
+Signed-By: /usr/share/keyrings/synodeb-archive-keyring.gpg

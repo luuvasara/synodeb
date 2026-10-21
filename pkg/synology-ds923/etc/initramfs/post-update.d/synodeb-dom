@@ -1,0 +1,16 @@
+#!/bin/sh
+# update-initramfs (-u/-c) calls this hook with: $1 version, $2 path of the initrd.
+# If it is the kernel of a DOM entry (/boot/vmlinuz or /boot/vmlinuz.old), copy it to the DOM again.
+# Never makes update-initramfs fail.
+ver=${1:-}
+ischroot -t 2>/dev/null && exit 0
+blkid -U 45e5b07d-4783-4867-a369-f99c0cd1e610 >/dev/null 2>&1 || exit 0
+cur=$(readlink /boot/vmlinuz 2>/dev/null | sed 's/^vmlinuz-//')
+old=$(readlink /boot/vmlinuz.old 2>/dev/null | sed 's/^vmlinuz-//')
+case "$ver" in
+"") ;;
+"$cur"|"$old") ;;
+*) exit 0 ;;
+esac
+/usr/sbin/synodeb-dom sync >/dev/null || echo "synodeb: copying initrd $ver to the DOM failed" >&2
+exit 0

@@ -1,0 +1,33 @@
+#!/bin/sh
+set -e
+for f in /etc/systemd/journald.conf.d/synodeb-volatile.conf /etc/systemd/system/synodeb-journal-archive.service \
+         /etc/systemd/system/synodeb-journal-archive-shutdown.service /etc/systemd/system/synodeb-journal-archive.timer \
+         /etc/initramfs-tools/scripts/init-premount/synodeb-rootcheck /etc/initramfs-tools/scripts/init-top/synodeb-bootlog; do
+    dpkg-maintscript-helper rm_conffile "$f" 3.0~ synology-ds923 -- "$@"
+done
+if [ "$1" = configure ]; then
+    # notify.conf may hold tokens and passwords
+    chmod 600 /etc/synodeb/notify.conf 2>/dev/null || true
+    # amd64-microcode has no update for the R1600 (00810F81): keep it out of the initramfs
+    # (AMD64UCODE_INITRAMFS=auto brings it back if a future version has one)
+    f=/etc/default/amd64-microcode
+    if [ -f $f ] && ! grep -q '^AMD64UCODE_INITRAMFS=' $f; then
+        printf '%s\n' '# synodeb: no microcode update for 00810F81 (R1600), smaller initramfs' 'AMD64UCODE_INITRAMFS=no' >> $f
+    fi
+    update-initramfs -u -k all || true
+    # /boot/vmlinuz(.old) and the copy on the DOM: the kernel may have been installed before
+    # this package and its hook (on a new system the installer does exactly that)
+    # (the hook also creates the initrd of the newest kernel if it is missing)
+    newest=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|^/boot/vmlinuz-||' | sort -V | tail -n 1)
+    /etc/kernel/postinst.d/zz-synodeb-boot-links $newest || true
+    udevadm control --reload || true
+    udevadm trigger --subsystem-match=tty --action=add || true
+    systemctl daemon-reload || true
+    systemctl enable synohwd.service synodeb-nvme-power-limit.service synodeb-boot-ok.service \
+        synodeb-nut-firewall.service || true
+    # UPS (NUT): /etc/nut is written by 'synodeb-ups setup', here only if NUT is installed
+    # and not configured by synodeb yet
+    if [ -d /etc/nut ] && ! grep -q '^# synodeb' /etc/nut/upsmon.conf 2>/dev/null; then
+        /usr/sbin/synodeb-ups setup || true
+    fi
+fi

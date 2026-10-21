@@ -1,0 +1,6 @@
+# synodeb: the DS923+ runs the synodeb kernel only (platform drivers, signed modules, copy
+# on the DOM). Debian kernels must never be installed, not even as a dependency of a
+# metapackage: priority -1 for every Debian kernel package.
+Package: linux-image-* linux-headers-* linux-signed-* linux-image-amd64 linux-headers-amd64
+Pin: release o=Debian
+Pin-Priority: -1
