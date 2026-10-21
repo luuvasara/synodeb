@@ -227,6 +227,7 @@ cmd_install() {
         cp "$LOCAL/vmlinuz" "$LOCAL/installer.img" "$T/" || die "files not found in $LOCAL"
     else
         case "$SHA_VMLINUZ$SHA_INSTALLER" in *@*) die "this copy of the script has no installer hashes: download it from the release" ;; esac
+        command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || die "curl or wget needed to download the installer"
         for f in vmlinuz installer.img; do
             say "Downloading $f ..."
             if command -v curl >/dev/null 2>&1; then
