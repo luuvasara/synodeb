@@ -1,0 +1,34 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Architectures: amd64
+Codename: trixie
+Components: main
+Date: Wed, 21 Oct 2026 22:49:51 +0000
+Description: synodeb: Debian on the Synology DS923+
+Label: synodeb
+Origin: synodeb
+Suite: trixie
+MD5Sum:
+ 5ed988cea2f0cc6a21c0b990f5661840             4611 main/binary-amd64/Packages
+ f233a3fcf489c478dc6e589915266627             2143 main/binary-amd64/Packages.gz
+ ee4e4c755ab629a83908ddd55b661fe2             2160 main/binary-amd64/Packages.xz
+SHA1:
+ f8e964dd0de5f3c4abd2e5e70cbda77bfa74038e             4611 main/binary-amd64/Packages
+ 379a1cd31cfb600276c615771cf0bb7e2c63c3d1             2143 main/binary-amd64/Packages.gz
+ 1410564c2c5c291e1a96bbfcc03e31943b790e8f             2160 main/binary-amd64/Packages.xz
+SHA256:
+ 1182bcbac51b37b5fde170d914d137f66eb354eb6c18868f2d920197d5d17cdb             4611 main/binary-amd64/Packages
+ aceda805d350f2447d7292e4cfa960d4ac59ff786ddbf1ddd87229b6bb6e9159             2143 main/binary-amd64/Packages.gz
+ 59e83080d913c222c753b34db28343cc910dbed060a7f4bb00dfe363161199c1             2160 main/binary-amd64/Packages.xz
+SHA512:
+ 631d74be51f599a007fbc4f044194561a41fefbe5debab10e3fac68949e8a24a50d63889db862e9f7ffc7c1d221b11a3e974d2521a771666e3f9cd60921f7d4a             4611 main/binary-amd64/Packages
+ eb179573221c42a965cac6c3d49fddf36698bc26ad646be0d34f099b5c06470f87a7f6b45914c3875cc03d52bff2816f0b9eae3f432551adbe01bb7b8c5308c5             2143 main/binary-amd64/Packages.gz
+ ffd1db328871614966bf36ab7421a8ee6e033bac3448a2b5eda07ee1d8f5fe138fa4dfe2690a2ddac165563012985b46b98d212f40c8e4440064998773408b89             2160 main/binary-amd64/Packages.xz
+-----BEGIN PGP SIGNATURE-----
+
+iHUEARYKAB0WIQTO4qb6llf7PL1h6gdCAK21VQ5t7gUCatlBjwAKCRBCAK21VQ5t
+7iTOAP9FmOleBgOBxNVe/c/RIyPqr3ZOF8TQ3byjCYTuNbukSAEAm+rsdZjCWsw+
+C/iRl9VzcG+q9SpzbYCNp3RCcQjanwE=
+=Z1jS
+-----END PGP SIGNATURE-----
