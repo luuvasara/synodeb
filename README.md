@@ -30,9 +30,7 @@ This project is not affiliated with, endorsed or supported by Synology Inc. "Syn
 
 ## What works
 
-Tested on a DS923+ (AMD Ryzen R1600) with Debian 13 trixie and the synodeb kernel 7.3. The SSH
-installer is the newest part: it was tested end to end in a virtual machine (installation,
-reconnecting during the installation, kernel updates and the fallback to the previous kernel).
+Tested on a DS923+ (AMD Ryzen R1600) with Debian 13 trixie and the synodeb kernel 7.3.
 Please report problems in the [issues](https://github.com/rylos/synodeb/issues).
 
 | | |
