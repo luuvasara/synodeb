@@ -8,7 +8,7 @@ fans, LEDs, buttons, beeper, power schedule, UPS, watchdog, all four bays and bo
 synodeb turns a **Synology DS923+** into a plain **Debian trixie** server. A small Linux
 kernel (7.3) with drivers for the DS923+ platform is started by the NAS's own boot loader,
 and the official **Debian installer** runs over **SSH**, because the NAS has no screen. You
-choose the disks, RAID, LVM, encryption and filesystems in the installer, as on any Debian
+choose the disks, RAID, LVM and filesystems in the installer, as on any Debian
 machine.
 
 DSM can stay: install Debian on a new disk or on the NVMe drives, keep the DSM disks
@@ -78,7 +78,8 @@ administrator account. The installer downloads Debian from the internet.
    ```
 
    Choose *Start installer* and follow the Debian installer. In *Partition disks* select
-   where Debian goes (see [Keeping DSM](#keeping-dsm)). The SSH session stays up for the
+   where Debian goes (see [Keeping DSM](#keeping-dsm)); do not choose *encrypted LVM*, an
+   encrypted root cannot be unlocked at boot. The SSH session stays up for the
    whole installation; if it drops, connect again and the installer is where you left it.
 5. At the end the NAS reboots into Debian. Log in with the user you created:
    `ssh <user>@<address>`. With `--network dsm` Debian keeps the address DSM had; with
