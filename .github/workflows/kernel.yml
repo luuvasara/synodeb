@@ -1,0 +1,122 @@
+# Builds and publishes the synodeb kernel when kernel.org releases a new stable version of the
+# series in kernel/VERSION (7.3 -> 7.3.1 -> 7.3.2 ...): new ABI, packages signed and added to
+# the apt repository on gh-pages, kernel/VERSION committed to main.
+# Needs the secret SYNODEB_SIGNING_KEY: the armored private key of the repository
+# (gpg --export-secret-keys --armor CEE2A6FA9657FB3CBD61EA074200ADB5550E6DEE).
+name: kernel
+
+on:
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+    inputs:
+      rebuild:
+        description: Build even without a new stable release (new ABI, e.g. after a patch change)
+        type: boolean
+        default: false
+      installer:
+        description: Also rebuild and publish the installer (updates synodeb-setup.sh)
+        type: boolean
+        default: false
+      publish:
+        description: Publish (false = build only, as a test)
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pages: write
+
+concurrency:
+  group: kernel
+
+jobs:
+  kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish }}
+      INSTALLER: ${{ github.event_name == 'workflow_dispatch' && inputs.installer }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: New stable release?
+        id: check
+        env:
+          REBUILD: ${{ inputs.rebuild || false }}
+        run: |
+          . kernel/VERSION
+          series=$(echo "$KVER" | cut -d. -f1,2)
+          latest=$(curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v${series%%.*}.x/" |
+              grep -oE "linux-${series//./\\.}(\.[0-9]+)?\.tar\.xz" | sed 's/^linux-//; s/\.tar\.xz$//' |
+              sort -uV | tail -n 1)
+          [ -n "$latest" ] || { echo "no $series release found on kernel.org" >&2; exit 1; }
+          echo "kernel/VERSION: $KVER ABI $ABI, kernel.org: $latest"
+          if [ "$latest" = "$KVER" ] && [ "$REBUILD" != true ]; then
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+          sed -i -e "s/^KVER=.*/KVER=$latest/" -e "s/^ABI=.*/ABI=$((ABI + 1))/" kernel/VERSION
+          . kernel/VERSION
+          echo "new kernel: $KREL ($KPKGVER)"
+          { echo "build=true"; echo "krel=$KREL"; } >> "$GITHUB_OUTPUT"
+
+      - name: Signing key
+        if: steps.check.outputs.build == 'true' && env.PUBLISH == 'true'
+        env:
+          KEY: ${{ secrets.SYNODEB_SIGNING_KEY }}
+        run: |
+          [ -n "$KEY" ] || { echo "secret SYNODEB_SIGNING_KEY is not set" >&2; exit 1; }
+          export GNUPGHOME=$RUNNER_TEMP/gnupg
+          mkdir -m 700 "$GNUPGHOME"
+          echo "$KEY" | gpg --batch -q --import
+          gpg -K --with-colons | grep -q '^fpr:::::::::CEE2A6FA9657FB3CBD61EA074200ADB5550E6DEE:' ||
+              { echo "wrong signing key" >&2; exit 1; }
+          gpgconf --kill all
+          echo "SYNODEB_GNUPG=$GNUPGHOME" >> "$GITHUB_ENV"
+
+      - name: Free disk space
+        if: steps.check.outputs.build == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          df -h /
+
+      - name: Build the kernel
+        if: steps.check.outputs.build == 'true'
+        run: kernel/run-build.sh
+
+      - name: Build the installer
+        if: steps.check.outputs.build == 'true' && env.INSTALLER == 'true'
+        run: installer/run-build.sh
+
+      - uses: actions/checkout@v4
+        if: steps.check.outputs.build == 'true' && env.PUBLISH == 'true'
+        with:
+          ref: gh-pages
+          path: build/pages
+
+      - name: Publish
+        if: steps.check.outputs.build == 'true' && env.PUBLISH == 'true'
+        env:
+          KREL: ${{ steps.check.outputs.krel }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SKIP_INSTALLER=1
+          [ "$INSTALLER" = true ] && SKIP_INSTALLER=0
+          SKIP_INSTALLER=$SKIP_INSTALLER tools/publish.sh
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C build/pages add -A
+          git -C build/pages commit -qm "apt repository: kernel $KREL"
+          git -C build/pages push -q origin gh-pages
+          git add kernel/VERSION synodeb-setup.sh
+          git commit -qm "kernel $KREL"
+          git push -q origin HEAD:main
+          gh api -X POST "repos/$GITHUB_REPOSITORY/pages/builds" >/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: steps.check.outputs.build == 'true' && env.PUBLISH != 'true'
+        with:
+          name: kernel-${{ steps.check.outputs.krel }}
+          path: build/out/*.deb
+          retention-days: 7

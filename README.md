@@ -155,14 +155,37 @@ Configuration:
 - `/etc/synohwd.toml`: fan curves, beeper, power on after AC loss, Wake-on-LAN.
 - `/etc/synodeb/notify.conf`: notifications (SMTP, Telegram, ntfy). Nothing is sent until a
   channel is configured.
-- `/etc/synodeb/ups.conf`: UPS behaviour; `NETWORK_CLIENTS` lets other machines (Home
-  Assistant, another NAS) use the UPS through NUT. NUT is enabled when a USB UPS is connected
-  at install time; to add one later, connect it and run `sudo synodeb-ups setup --keep-password`.
+- `/etc/synodeb/ups.conf`: UPS behaviour, see [UPS](#ups).
 - `/etc/default/synodeb`: extra kernel parameters (run `synodeb-dom setup` after a change).
+
+**UPS.** <a id="ups"></a>A USB UPS works like on DSM: when its battery runs low the NAS enters
+*Safe Mode* (services stopped, volumes unmounted, disks in standby) instead of powering off,
+and reboots by itself when mains power is back.
+
+- **Connected during the installation**: nothing to do, NUT is set up and enabled.
+- **Connected later**: plug it in and run `sudo synodeb-ups setup --keep-password`.
+- **Check**: `synodeb-ups status` (or `upsc ups@localhost`).
+- **Other machines using this UPS** (Home Assistant, another NAS, a PC with NUT): put their
+  addresses in `/etc/synodeb/ups.conf`, set the password of the NUT user `monuser` and apply:
+
+  ```sh
+  sudo nano /etc/synodeb/ups.conf          # NETWORK_CLIENTS="192.168.1.10 192.168.1.11"
+  sudo synodeb-ups passwd                  # password of monuser (e.g. the one DSM used)
+  sudo synodeb-ups setup --keep-password
+  sudo systemctl restart synodeb-nut-firewall nut-server
+  ```
+
+  The clients connect to port 3493 with UPS name `ups`, user `monuser` and that password; only
+  the listed addresses are allowed. A client that was set up for DSM keeps working once the
+  password is the same.
+- Other options in the same file: dry run (`DRYRUN=1`, Safe Mode only logged), what to do when
+  the UPS stops answering (`NOCOMM_SAFEMODE`), powering the UPS off at the end (`SAFESHUTDOWN`).
 
 **Kernel updates.** The kernel and `synology-ds923` come from the synodeb apt repository and
 are updated with `sudo apt update && sudo apt full-upgrade` (a new kernel is a new package, as
-with Debian's own kernels), then a reboot. Debian's own security updates are installed
+with Debian's own kernels), then a reboot. New stable releases of the kernel series (7.3.1,
+7.3.2…) are built and published automatically, usually within a day of their release on
+kernel.org. Debian's own security updates are installed
 automatically; the kernel never is, because a kernel update writes the DOM. The DOM keeps two kernels: if the new one does not boot, the next boot starts the
 previous one and you get a notification. A normal boot never writes the DOM.
 
@@ -204,14 +227,18 @@ tools/publish.sh             # apt repository and installer for GitHub Pages (bu
 tests/run-test-setup.sh DOM.img   # synodeb-setup.sh against a copy of a DOM image
 ```
 
+The GitHub workflow [`kernel`](.github/workflows/kernel.yml) checks kernel.org every day: when a
+new stable release of the series in `kernel/VERSION` is out it bumps the version and ABI, builds
+the kernel, adds it to the signed apt repository and commits the new `kernel/VERSION`. It can
+also be started by hand (rebuild with a new ABI, rebuild the installer, or build only).
+
 ## Known limitations
 
 - **No root on an encrypted volume**: unlocking it at boot would need a console. Encrypt data
   volumes instead (with a key file on the root filesystem).
 - **No ZFS**: OpenZFS does not support Linux 7.3 yet. btrfs, mdadm, LVM, XFS and ext4 work.
 - The installer and the system are reached over the network only. The internal serial port
-  (a 2×3 header behind the front grille, 115200 8N1) shows the boot menu and the console, for
-  debugging.
+  shows the boot menu and the console, for debugging: see [docs/serial.md](docs/serial.md).
 - Only the DS923+ is supported.
 
 ## Related projects

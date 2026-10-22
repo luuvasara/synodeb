@@ -12,7 +12,6 @@ GNUPG=${SYNODEB_GNUPG:-$HOME/.local/share/synodeb/gnupg}
 [ -d "$GNUPG" ] || { echo "signing key not found in $GNUPG" >&2; exit 1; }
 # shellcheck source=/dev/null
 . "$ROOT/kernel/VERSION"
-KREL=$KVER.0-$ABI-ds923
 OUT=$ROOT/build/out
 INST=$OUT/installer
 # SKIP_INSTALLER=1: publish the packages only, the installer stays as it is
@@ -23,7 +22,7 @@ fi
 PKGVER=$(sed -n 's/^Version: //p' "$ROOT/pkg/synology-ds923/DEBIAN/control")
 
 docker run --rm -v "$ROOT":/work -v "$GNUPG":/gnupg -e KREL="$KREL" -e PKGVER="$PKGVER" \
-    -e KDEBVER="$KVER.0-$ABI" -e HOSTUID="$(id -u)" -e SKIP_INSTALLER="${SKIP_INSTALLER:-0}" debian:trixie bash -euo pipefail -c '
+    -e KDEBVER="$KPKGVER" -e HOSTUID="$(id -u)" -e SKIP_INSTALLER="${SKIP_INSTALLER:-0}" debian:trixie bash -euo pipefail -c '
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get install -y -qq apt-utils gpg dpkg-dev >/dev/null
 P=/work/build/pages
@@ -74,4 +73,4 @@ si=$(sha256sum "$INST/installer.img" | cut -d' ' -f1)
 sed -i -e "s|^INSTALLER_DIR=.*|INSTALLER_DIR=installer/$KREL|" \
        -e "s|^SHA_VMLINUZ=.*|SHA_VMLINUZ=$sv|" -e "s|^SHA_INSTALLER=.*|SHA_INSTALLER=$si|" "$ROOT/synodeb-setup.sh"
 cp "$ROOT/synodeb-setup.sh" "$ROOT/build/pages/synodeb-setup.sh"
-find "$ROOT/build/pages" -type f | sed "s|$ROOT/build/pages/||" | sort
+find "$ROOT/build/pages" -type f -not -path "*/.git/*" | sed "s|$ROOT/build/pages/||" | sort

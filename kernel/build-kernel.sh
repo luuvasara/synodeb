@@ -7,8 +7,7 @@ set -euo pipefail
 VER=$KVER
 SRC=/work/build/linux-$VER
 OUT=/work/build/out
-KREL=$VER.0-$ABI-ds923           # uname -r
-PKGVER=$VER.0-$ABI
+PKGVER=$KPKGVER
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential bc bison flex libssl-dev libelf-dev \
     dwarves libdw-dev rsync kmod cpio debhelper-compat python3 xz-utils zstd git lsb-release \

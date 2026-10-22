@@ -12,8 +12,7 @@ MIRROR=${MIRROR:-https://deb.debian.org/debian}
 DIST=trixie
 # shellcheck source=/dev/null
 . $W/kernel/VERSION
-KREL=$KVER.0-$ABI-ds923
-KDEB=$OUT/linux-image-${KREL}_$KVER.0-${ABI}_amd64.deb
+KDEB=$OUT/linux-image-${KREL}_${KPKGVER}_amd64.deb
 [ -f "$KDEB" ] || { echo "$KDEB missing: build the kernel first (kernel/run-build.sh)" >&2; exit 1; }
 
 export DEBIAN_FRONTEND=noninteractive
