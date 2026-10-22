@@ -74,7 +74,7 @@ for kind in image headers; do
 Package: linux-$kind-ds923
 Version: $PKGVER
 Architecture: amd64
-Maintainer: synodeb <synodeb@users.noreply.github.com>
+Maintainer: Marco Ziliani <508111+rylos@users.noreply.github.com>
 Depends: linux-$kind-$KREL (= $PKGVER)
 Section: kernel
 Priority: optional

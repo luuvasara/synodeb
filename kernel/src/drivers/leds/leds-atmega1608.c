@@ -151,6 +151,6 @@ static struct i2c_driver atmega_driver = {
 };
 module_i2c_driver(atmega_driver);
 
-MODULE_AUTHOR("synodeb contributors");
+MODULE_AUTHOR("Marco Ziliani <508111+rylos@users.noreply.github.com>");
 MODULE_DESCRIPTION("Synology ATmega1608 disk LED controller");
 MODULE_LICENSE("GPL");

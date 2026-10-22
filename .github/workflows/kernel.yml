@@ -104,8 +104,8 @@ jobs:
           SKIP_INSTALLER=1
           [ "$INSTALLER" = true ] && SKIP_INSTALLER=0
           SKIP_INSTALLER=$SKIP_INSTALLER tools/publish.sh
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git config --global user.name 'Marco Ziliani'
+          git config --global user.email '508111+rylos@users.noreply.github.com'
           git -C build/pages add -A
           git -C build/pages commit -qm "apt repository: kernel $KREL"
           git -C build/pages push -q origin gh-pages

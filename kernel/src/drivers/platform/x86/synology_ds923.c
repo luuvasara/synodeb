@@ -851,6 +851,6 @@ static void __exit ds923_exit(void)
 module_init(ds923_init);
 module_exit(ds923_exit);
 
-MODULE_AUTHOR("synodeb contributors");
+MODULE_AUTHOR("Marco Ziliani <508111+rylos@users.noreply.github.com>");
 MODULE_DESCRIPTION("Synology DS923+ platform: bays, USB VBUS, fans, RTC/LED devices, microcontroller shutdown");
 MODULE_LICENSE("GPL");
