@@ -21,9 +21,9 @@ for (c,r),(n,s,col) in pins.items():
     if r==0: d.text((x,y-48),s,fill=col,font=t4,anchor='md')
     elif n=='2': d.text((x,y+50),"GND",fill=col,font=t4,anchor='ma')
     else: d.text((x-14,y+62),s,fill=col,font=t4,anchor='rm')
-d.text((hx+2*p+110,hy),"back row",fill=GREY,font=t4,anchor='lm')
+d.text((hx+2*p+110,hy),"outer row",fill=GREY,font=t4,anchor='lm')
 d.text((hx+2*p+110,hy+32),"pin 1 = 3.3 V: do NOT connect",fill=RED,font=F(R,22),anchor='lm')
-d.text((hx+2*p+110,hy+p),"front row",fill=BLK,font=t4,anchor='lm')
+d.text((hx+2*p+110,hy+p),"row next to the board",fill=BLK,font=t4,anchor='lm')
 d.text((hx+2*p+110,hy+p+32),"pin 2 = GND (not measured)",fill=(90,90,90),font=F(R,22),anchor='lm')
 yx,y0,st=1180,580,70
 names=['DTR','RXD','TXD','VCC','CTS','GND']

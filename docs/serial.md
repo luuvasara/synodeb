@@ -6,11 +6,13 @@ and a login prompt. It helps when a system does not come up on the network.
 
 ![Wiring of the serial console](img/serial-console.png)
 
+![The header seen through the front grille](img/serial-header.png)
+
 - **Header**: 2×3 pins, 2.0 mm pitch, on the mainboard behind the front grille. It can be
   reached from below, through the grille, with the NAS closed.
-- **Signals**, front row (pins 6-4-2, from the left, seen from the front): pin 6 is RX of the
+- **Signals**, in the row next to the board (pins 6-4-2, from the left): pin 6 is RX of the
   NAS (to TXD of the adapter), pin 4 is TX of the NAS (to RXD of the adapter), pin 2 is GND.
-  Pin 1, in the back row, carries 3.3 V: **do not connect it**.
+  Pin 1, in the outer row, carries 3.3 V: **do not connect it**.
 - **Ground**: pin 2, or the metal shell of the front USB port (the shell only, never the
   contacts inside, which carry 5 V).
 - **Adapter**: any USB-UART adapter **at 3.3 V** (FT232RL, CP2102, CH340…). A 5 V adapter
