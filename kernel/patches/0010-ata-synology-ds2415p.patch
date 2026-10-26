@@ -1,0 +1,41 @@
+diff --git a/drivers/ata/Kconfig b/drivers/ata/Kconfig
+index b38bc7eaf..fdba4044f 100644
+--- a/drivers/ata/Kconfig
++++ b/drivers/ata/Kconfig
+@@ -137,6 +137,24 @@ config SATA_AHCI
+ 
+ 	  If unsure, say N.
+ 
++config SYNOLOGY_DS2415P
++	tristate "Synology DS2415+ bay LEDs and DX1215 expansion unit"
++	depends on SATA_AHCI && SATA_PMP && X86 && DMI && PCI
++	depends on LEDS_CLASS && HWMON
++	select SATA_PMP_VENDOR_EH
++	help
++	  Hardware of the Synology DS2415+ NAS (Atom C2538) that DSM drives
++	  itself and the BIOS leaves off: the orange fault LEDs of the
++	  twelve bays (GPIO block of the three Marvell 88SE9215 plus an
++	  enable on the SoC GPIO 49), the green link/activity function of
++	  those LEDs, and the DX1215 expansion unit behind the 88SE9235
++	  (fan level, fan alarms, bay LEDs, mode switch) through the GPIO
++	  pins of its four Marvell 88SM9705 port multipliers.
++
++	  It binds only on the DS2415+ board (DMI and PCI topology). To
++	  compile this driver as a module, choose M here: the module will
++	  be called synology_ds2415p.
++
+ config SATA_MOBILE_LPM_POLICY
+ 	int "Default SATA Link Power Management policy"
+ 	range 0 5
+diff --git a/drivers/ata/Makefile b/drivers/ata/Makefile
+index 20e6645ab..1937951b0 100644
+--- a/drivers/ata/Makefile
++++ b/drivers/ata/Makefile
+@@ -4,6 +4,7 @@ obj-$(CONFIG_ATA)		+= libata.o
+ 
+ # non-SFF interface
+ obj-$(CONFIG_SATA_AHCI)		+= ahci.o libahci.o
++obj-$(CONFIG_SYNOLOGY_DS2415P)	+= synology_ds2415p.o
+ obj-$(CONFIG_SATA_ACARD_AHCI)	+= acard-ahci.o libahci.o
+ obj-$(CONFIG_SATA_AHCI_SEATTLE)	+= ahci_seattle.o libahci.o libahci_platform.o
+ obj-$(CONFIG_SATA_AHCI_PLATFORM) += ahci_platform.o libahci.o libahci_platform.o

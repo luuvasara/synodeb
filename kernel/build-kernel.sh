@@ -54,12 +54,25 @@ else
 fi
 rsync -rc --itemize-changes /work/kernel/src/ ./
 cp /work/kernel/config-debian-7.3-rc7 .config
-scripts/kconfig/merge_config.sh -m .config /work/kernel/ds923.config /work/kernel/ds923-slim.config
+# EXTRA_CONFIGS: more fragments of kernel/, merged last (e.g. EXTRA_CONFIGS=ds2415p.config).
+# Empty by default: the .config is then the DS923+ one, unchanged.
+extra=()
+for f in ${EXTRA_CONFIGS:-}; do
+    extra+=("/work/kernel/$f")
+done
+scripts/kconfig/merge_config.sh -m .config /work/kernel/ds923.config /work/kernel/ds923-slim.config \
+    "${extra[@]}"
 make olddefconfig
 for o in SYNOLOGY_DS923=y LEDS_ATMEGA1608=m RTC_DRV_S35390A=y RTC_DRV_CMOS=m PINCTRL_AMD=y \
          SERIAL_8250_DW=y I2C_DESIGNWARE_PLATFORM=y EFI_VARS_PSTORE_DEFAULT_DISABLE=y \
          ATA_LEDS=y LEDS_TRIGGER_TIMER DEBUG_INFO_NONE; do
     grep -E "^CONFIG_$o" .config || { echo "missing CONFIG_$o"; exit 1; }
+done
+# every value an extra fragment sets must survive olddefconfig
+for f in "${extra[@]}"; do
+    grep -E '^CONFIG_[A-Z0-9_]+=' "$f" | while IFS= read -r l; do
+        grep -qx "$l" .config || { echo "missing $l ($f)"; exit 1; }
+    done || exit 1
 done
 make -j"$(nproc)" bindeb-pkg KDEB_PKGVERSION="$PKGVER" LOCALVERSION="-$ABI-ds923"
 [ "$(make -s kernelrelease LOCALVERSION="-$ABI-ds923")" = "$KREL" ] || { echo "kernelrelease is not $KREL" >&2; exit 1; }
