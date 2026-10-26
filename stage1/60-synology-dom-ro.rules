@@ -1,0 +1,6 @@
+# Keeps the Synology DOM (internal USB flash, f400:f400) read-only in a system booted through
+# stage-1: that system never needs to write the DOM (kernel updates go to the disks). To
+# change stage-1 on purpose, stage1/install-dom.sh lifts it with blockdev --setrw around the
+# write. Not for the A/B boot of the DS923+, whose synodeb-dom writes the DOM.
+ACTION=="add|change", SUBSYSTEM=="block", ENV{ID_VENDOR_ID}=="f400", ENV{ID_MODEL_ID}=="f400", RUN+="/usr/sbin/blockdev --setro /dev/%k"
+SUBSYSTEM=="block", ENV{ID_VENDOR_ID}=="f400", ENV{ID_MODEL_ID}=="f400", ENV{UDISKS_IGNORE}="1", ENV{UDISKS_AUTO}="0"

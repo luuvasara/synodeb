@@ -78,12 +78,32 @@ The DSM command line is the `kernel` line of the `SYNOLOGY_2` entry of a GRUB 0.
 show` adds (`macs=`, `sn=`, decoded from the DOM's `vender` file with the DS2415+ layout),
 plus `acpi_rsdp=`. On a GRUB2 DOM (DS923+) the entry is not found and the leg is skipped.
 
+## Putting stage-1 on a GRUB 0.97 DOM
+
+`stage1/install-dom.sh` (run as root on Linux on the NAS, not on DSM) writes stage-1 to a DOM
+whose Synology boot loader is GRUB 0.97 (menu.lst syntax, as on the DS2415+):
+
+```sh
+sudo stage1/install-dom.sh install build/out/stage1   # backup, /stage1 on synoboot2, STAGE1 entry
+sudo stage1/install-dom.sh status
+sudo stage1/install-dom.sh default dsm                # or: default stage1
+sudo stage1/install-dom.sh remove                     # original conf back, DSM boots
+```
+
+It backs up the whole DOM first, keeps the original conf as `SynoBootLoader.conf.dsm`, makes
+`STAGE1` the default and `SYNOLOGY_2` the fallback, and writes each partition as a checked copy
+(`fsck.vfat`, `dd conv=fsync`, read back). `--cmdline` replaces the stage-1 command line
+(default `console=ttyS0,115200n8 panic=10 quiet noefi stage1.mcu=ttyS1`, the DS2415+ values).
+`60-synology-dom-ro.rules` keeps the DOM read-only in the installed system (copy it to
+`/etc/udev/rules.d/`); `install-dom.sh` lifts that around its own writes.
+
 ## Build and test
 
 ```sh
 stage1/run-build.sh                 # build/out/stage1: vmlinuz, initrd.gz, VERSION, SHA256SUMS
 PMP_QUIRK=1 stage1/run-build.sh     # with libata.ko rebuilt with kernel/patches/*libata-pmp*
 tests/stage1/run-test-stage1.sh     # boots it in QEMU against disk and USB-stick images
+docker run --rm --privileged -v "$PWD":/work debian:trixie bash /work/tests/stage1/test-install-dom.sh
 ```
 
 The kernel is Debian trixie's own (`linux-image-amd64`), unchanged. The initrd is busybox,
