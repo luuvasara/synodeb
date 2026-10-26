@@ -238,7 +238,9 @@ also be started by hand (rebuild with a new ABI, rebuild the installer, or build
 - **No ZFS**: OpenZFS does not support Linux 7.3 yet. btrfs, mdadm, LVM, XFS and ext4 work.
 - The installer and the system are reached over the network only. The internal serial port
   shows the boot menu and the console, for debugging: see [docs/serial.md](docs/serial.md).
-- Only the DS923+ is supported.
+- Only the DS923+ is supported. An experimental kexec boot for older units, which never
+  writes the DOM, is in [stage1/](stage1/README.md); [docs/stage1-unraid.md](docs/stage1-unraid.md)
+  shows it booting Unraid from a USB stick.
 
 ## Related projects
 
