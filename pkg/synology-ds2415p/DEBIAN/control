@@ -1,0 +1,17 @@
+Package: synology-ds2415p
+Version: 1.0
+Architecture: all
+Maintainer: synodeb <synodeb@localhost>
+Depends: linux-image-ds923, python3 (>= 3.11), hdparm, ethtool, util-linux, systemd, coreutils
+Conflicts: synology-ds923
+Recommends: smartmontools, lm-sensors, mdadm
+Section: kernel
+Priority: optional
+Homepage: https://github.com/rylos/synodeb
+Description: Debian on the Synology DS2415+: hardware control
+ synohwd for the front-panel microcontroller of the DS2415+ (ttyS1): fan duty
+ from DSM's tables, keepalive, status and alert LEDs, beeper, power-on after
+ an AC loss, scheduled power-on, Wake-on-LAN. With the kernel driver
+ synology_ds2415p (kernel built with EXTRA_CONFIGS=ds2415p.config) it also
+ drives the orange bay LEDs and the DX1215 expansion unit: fan level from the
+ DX1215 disk temperatures, fan alarms, bay LEDs.

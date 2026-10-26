@@ -1,0 +1,4 @@
+/etc/modules-load.d/synology-ds2415p.conf
+/etc/synohwd.toml
+/etc/systemd/system/synohwd.service
+/etc/udev/rules.d/60-synology-ds2415p.rules

@@ -1,0 +1,1275 @@
+#!/usr/bin/python3 -I
+"""synohwd — Synology DS923+ hardware daemon for Debian.
+
+Takes over the hardware management DSM does on this model, using the front-panel
+microcontroller (uP) on the AMD UART at MMIO 0xFEDCA000 (AMDI0020:01) and the
+DS923+ drivers built into the linux-image-7.3.0-ds923 kernel (synology_ds923,
+leds-atmega1608, rtc-s35390a).
+
+uP protocol (9600 8N1, ASCII):
+  host -> uP   '4' power LED on   '5' blink   '6' off
+               '7' status off  '8' green  '9' green blink  ':' orange  ';' orange blink
+               '2' short beep  '3' long beep
+               'V%02d' fan duty in %
+               'D' read the system current sensor -> reply 'D<digits>X'
+                   (DSM "system current sensor", value*16 + value*13/100, unit unknown:
+                   it is NOT the fan speed, the kernel measures that on GPIO 68/69)
+               'R' microP id  -> reply framed '+<n><n bytes>'
+               't' / 'u' disable / enable fan-fail check
+               'q' / 'p' power back on / stay off after an AC loss (DSM RCPower)
+               's' / 'r' enable / disable scheduled power-on (RTC alarm)
+               'l' / 'k' keep / drop NIC power in S5 for Wake-on-LAN
+               '@' 'A' 'B' USB LED on / blink / off
+               'C' reboot, '1' HARD POWER OFF: sent by the kernel at the very end of
+                   reboot/poweroff, like DSM. This daemon refuses any command with a
+                   '1' outside the V<nn> argument (so LA1 & co. are refused too).
+  uP -> host   '0' power button   'a' reset button   '`' USB copy button
+               'f' fan failure    'g' CPU fan failure
+
+Fans: hwmon "synology" (platform device synology-ds923) exposes fan1_input /
+fan2_input (rpm measured by the kernel), fan1_alarm / fan2_alarm (1 = stopped)
+and pwm1, which this daemon keeps in sync with the duty it sends.
+
+DS2415+ (model "ds2415p", recognised by itself or set in synohwd.toml): the uP is on
+ttyS1 (I/O 0x2F8) and takes only the bytes measured under DSM (see DS2415P_SAFE below),
+the DX1215 expansion unit is driven through the kernel's synology_ds2415p driver.
+
+Sub-commands:
+  synohwd run            the daemon (systemd)
+  synohwd status         sensors, fans, bays (from /run/synohwd/status.json)
+  synohwd send CMD       raw uP command through the daemon, e.g. 'synohwd send 2'
+"""
+
+import errno
+import glob
+import json
+import logging
+import os
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tomllib
+
+CONF_PATH = "/etc/synohwd.toml"
+RUN_DIR = "/run/synohwd"
+STATUS = f"{RUN_DIR}/status.json"
+CMD_FIFO = f"{RUN_DIR}/cmd"
+PLATFORM = "/sys/devices/platform/synology-ds923"
+SYS_BLOCK = "/sys/block"
+LEDS = "/sys/class/leds"
+UP_MMIO = 0xFEDCA000            # uP UART; 0xFEDC9000 is the serial console
+NOTIFY = "/usr/lib/synodeb/notify"  # synodeb notifier (/etc/synodeb/notify.conf)
+NOTIFY_WAIT = 30                # s a notification may delay a poweroff
+
+TEMP_MIN, TEMP_MAX = -20, 150   # °C, readings outside are discarded
+CRIT_READINGS = 2               # consecutive readings over a shutdown threshold
+FAN_ALARM_CYCLES = 2            # consecutive cycles with fanN_alarm = 1
+FAN_EVENT_HOLD = 60             # s a uP 'f'/'g' event keeps fan_fail set
+REPLY_TIMEOUT = 0.5             # s for a 'D' / '+' reply to complete
+D_MAX = 8                       # max digits in a 'D...X' reply
+FRAME_MAX = 16                  # max length of a '+' frame
+
+# Same fan curves as DSM 7.4 for the DS923+, as
+# (threshold °C, duty %); the last threshold of each list is the shutdown one.
+FAN_TABLES = {
+    "high": {  # DSM "cool mode"
+        "disk": [(0, 50), (41, 60), (46, 70), (50, 80), (53, 99)], "disk_shutdown": 61,
+        "nvme": [(0, 50), (44, 60), (52, 70), (60, 99)], "nvme_shutdown": 70,
+        "cpu": [(0, 50), (68, 70), (78, 99)], "cpu_shutdown": 95,
+        "nic": [(0, 50), (72, 70), (82, 99)], "nic_shutdown": 100,
+    },
+    "low": {  # DSM "quiet mode" (DSM default)
+        "disk": [(0, 50), (46, 60), (52, 70), (55, 80), (58, 99)], "disk_shutdown": 61,
+        "nvme": [(0, 50), (48, 60), (56, 70), (64, 99)], "nvme_shutdown": 70,
+        "cpu": [(0, 50), (78, 70), (86, 99)], "cpu_shutdown": 95,
+        "nic": [(0, 50), (78, 70), (88, 99)], "nic_shutdown": 100,
+    },
+}
+
+# Bay -> (PCI function of the SATA controller, port index) from model.dtb:
+# bays 1-2 on the JMB585 behind 00:01.5, bays 3-4 on the FCH SATA behind 00:08.2.
+BAYS = {1: ("00:01.5", 0), 2: ("00:01.5", 1), 3: ("00:08.2", 0), 4: ("00:08.2", 1)}
+
+DEFAULTS = {
+    "fan_mode": "low",          # low (quiet, DSM default) | high (cool) | full
+    "fan_period": 20,           # s between fan adjustments (DSM period)
+    "fan_min_duty": 0,          # floor for the duty from the tables
+    "hysteresis": 3,            # °C a sensor must drop below a step to slow down
+    "thermal_shutdown": True,   # power off at the DSM shutdown thresholds
+    "power_button": "poweroff", # poweroff | ignore | command:<shell>
+    "reset_button": "log",      # log | command:<shell>
+    "beep_on_start": True,
+    "beep_on_error": True,
+    "disk_leds": True,          # green = disk present, blinks off on I/O (kernel trigger ataN)
+    "led_brightness": 255,      # 1..254 dims the disk LEDs through PWM A
+    "disk_standby_minutes": 0,  # >0: spin the bay disks down after this idle time (hdparm -S)
+    "wol": False,               # Wake-on-LAN (magic packet) on all lan* ports
+    "ac_recovery": True,        # power back on after an AC loss (DSM enableRCPower=yes)
+    "model": "auto",            # auto | ds923 | ds2415p (auto: the DS2415+ is recognised)
+}
+
+log = logging.getLogger("synohwd")
+
+
+def notify(title, message="", priority="high", then=None):
+    """Send an event through the synodeb notifier, in the background; `then` (argv) runs
+    after it (at most NOTIFY_WAIT s later), so a poweroff does not cut the message off."""
+    def run():
+        if os.access(NOTIFY, os.X_OK):
+            try:
+                subprocess.run([NOTIFY, "-p", priority, title, message], timeout=NOTIFY_WAIT,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, check=False)
+            except (OSError, subprocess.SubprocessError) as e:
+                log.warning("notify: %s", e)
+        if then:
+            subprocess.Popen(then)
+    threading.Thread(target=run, daemon=True).start()
+
+
+def read(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def write(path, value):
+    try:
+        with open(path, "w") as f:
+            f.write(str(value))
+        return True
+    except OSError as e:
+        log.debug("write %s: %s", path, e)
+        return False
+
+
+def load_conf():
+    conf = dict(DEFAULTS)
+    try:
+        with open(CONF_PATH, "rb") as f:
+            conf.update(tomllib.load(f))
+    except FileNotFoundError:
+        pass
+    except tomllib.TOMLDecodeError as e:
+        log.error("%s: %s — using defaults", CONF_PATH, e)
+    return conf
+
+
+def check_cmd(cmd):
+    """Refuse '1' (uP hard power-off) anywhere except as a digit of V<nn>."""
+    if not cmd:
+        raise ValueError("empty command")
+    if "1" in re.sub(r"V\d\d", "", cmd):
+        raise ValueError(f"{cmd!r}: '1' is the uP hard power-off, refused")
+
+
+def up_tty():
+    """/dev node of the uP UART (8250 port with iomem_base 0xFEDCA000)."""
+    if os.path.exists("/dev/synology-up"):
+        return "/dev/synology-up"
+    for t in sorted(glob.glob("/sys/class/tty/ttyS*")):
+        v = read(f"{t}/iomem_base")
+        try:
+            if v and int(v, 16) == UP_MMIO:
+                return "/dev/" + os.path.basename(t)
+        except ValueError:
+            pass
+    raise SystemExit(f"uP UART (MMIO {UP_MMIO:#x}) not found")
+
+
+class Parser:
+    """uP byte stream parser, matches DSM behaviour but is loss-tolerant.
+
+    'D<digits>X' and '+<n><data>' are only parsed while the matching query is
+    pending, are bounded in length and time out after REPLY_TIMEOUT: a lost 'X'
+    or a garbage length byte can never swallow the bytes that follow. A byte that
+    ends a reply early is handled again as an event, so '0' (power) and 'a'
+    (reset) are not lost.
+    """
+
+    def __init__(self, on_event, on_reply):
+        self.on_event, self.on_reply = on_event, on_reply
+        self.expect, self.expect_until = None, 0.0   # pending query: 'D' or 'R'
+        self.state, self.buf, self.frame_len, self.since = None, "", 0, 0.0
+
+    def want(self, cmd, timeout):
+        self.expect, self.expect_until = cmd, time.monotonic() + timeout
+
+    def reset(self, why=None):
+        if why:
+            log.debug("uP reply dropped (%s): %r", why, self.buf)
+        self.state, self.buf, self.frame_len = None, "", 0
+
+    def tick(self, now):
+        if self.state and now - self.since > REPLY_TIMEOUT:
+            self.reset("timeout")
+
+    def done(self, value):
+        self.reset()
+        self.expect = None
+        self.on_reply(value)
+
+    def feed(self, b, now):
+        self.tick(now)
+        if self.state == "D":                       # 'D' <digits|*> 'X'
+            if b == "X":
+                self.done(self.buf)
+                return
+            if b.isdigit() or b == "*":
+                self.buf += "0" if b == "*" else b
+                if len(self.buf) > D_MAX:
+                    self.reset("too long")
+                return
+            self.reset(f"unexpected {b!r}")         # fall through: b is an event
+        elif self.state == "+len":                  # '+' <len> <data>
+            n = ord(b) - 48
+            if 1 <= n <= FRAME_MAX:
+                self.state, self.frame_len, self.buf = "+data", n, ""
+                return
+            self.reset(f"bad frame length {b!r}")   # fall through: b is an event
+        elif self.state == "+data":
+            self.buf += b
+            if len(self.buf) >= self.frame_len:
+                self.done(self.buf)
+            return
+        pending = self.expect if now <= self.expect_until else None
+        if b == "D" and pending == "D":
+            self.state, self.buf, self.since = "D", "", now
+        elif b == "+" and pending == "R":
+            self.state, self.since = "+len", now
+        else:
+            self.on_event(b)
+
+
+class MicroP:
+    def __init__(self, dev, check=None):
+        self.fd = os.open(dev, os.O_RDWR | os.O_NOCTTY)
+        attr = termios.tcgetattr(self.fd)
+        attr[0] = 0                                   # iflag: raw
+        attr[1] = 0                                   # oflag
+        attr[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+        attr[3] = 0                                   # lflag
+        attr[4] = attr[5] = termios.B9600
+        attr[6][termios.VMIN] = 0
+        attr[6][termios.VTIME] = 0
+        termios.tcsetattr(self.fd, termios.TCSANOW, attr)
+        termios.tcflush(self.fd, termios.TCIOFLUSH)
+        self.init_common(check)
+        log.info("microP on %s", dev)
+
+    def init_common(self, check=None):
+        self.check = check or check_cmd             # the model's refusal rule
+        self.wlock = threading.Lock()
+        self.qlock = threading.Lock()
+        self.reply = None
+        self.reply_ev = threading.Event()
+        self.parser = Parser(None, self._on_reply)
+
+    def _on_reply(self, value):
+        self.reply = value
+        self.reply_ev.set()
+
+    def send(self, cmd):
+        self.check(cmd)
+        with self.wlock:
+            os.write(self.fd, cmd.encode())
+            time.sleep(0.05)
+
+    def query(self, cmd, timeout=1.0):
+        with self.qlock:
+            self.reply_ev.clear()
+            self.reply = None
+            self.parser.want(cmd[0], timeout)
+            self.send(cmd)
+            return self.reply if self.reply_ev.wait(timeout) else None
+
+    def reader(self, on_event):
+        self.parser.on_event = on_event
+        empty = 0
+        while True:
+            r, _, _ = select.select([self.fd], [], [], 0.1)
+            now = time.monotonic()
+            if not r:
+                self.parser.tick(now)
+                continue
+            data = os.read(self.fd, 64)
+            if not data:                  # readable but nothing: hangup
+                empty += 1
+                if empty > 50:
+                    raise OSError("uP UART: end of file")
+                time.sleep(0.02)
+                continue
+            empty = 0
+            for b in data.decode("latin-1"):
+                self.parser.feed(b, now)
+
+
+def hwmon_by_name(name):
+    out = []
+    for d in glob.glob("/sys/class/hwmon/hwmon*"):
+        if read(f"{d}/name") == name:
+            out.append(d)
+    return out
+
+
+def hwmon_temp(d, label=None):
+    """Highest plausible temp*_input (or the one with that label) of a hwmon dir, °C."""
+    best = None
+    for inp in glob.glob(f"{d}/temp*_input"):
+        if label and read(inp.replace("_input", "_label")) != label:
+            continue
+        v = read(inp)
+        if v and v.lstrip("-").isdigit():
+            t = int(v) / 1000
+            if not TEMP_MIN <= t <= TEMP_MAX:
+                log.debug("%s: implausible %s °C ignored", inp, t)
+                continue
+            best = t if best is None else max(best, t)
+    return best
+
+
+def bay_disks():
+    """{bay: ('sdX', N)} following the ATA port topology of model.dtb; N is the libata
+    port number (sysfs .../ataN/, also the name of its LED trigger "ataN")."""
+    found = {}
+    for blk in glob.glob(f"{SYS_BLOCK}/sd*"):
+        path = os.path.realpath(f"{blk}/device")
+        m = re.search(r"/(0000:[0-9a-f:.]+)/(?:0000:[0-9a-f:.]+/)*.*?/ata(\d+)/", path)
+        if not m:
+            continue
+        ata = int(m.group(2))
+        for bay, (root, port) in BAYS.items():
+            if f"/0000:{root}/" not in path:
+                continue
+            ctrl = path.split(f"/ata{ata}/")[0]
+            ports = sorted(int(os.path.basename(p)[3:]) for p in glob.glob(f"{ctrl}/ata*")
+                           if os.path.basename(p)[3:].isdigit())
+            if ata in ports and ports.index(ata) == port:
+                found[bay] = (os.path.basename(blk), ata)
+    return found
+
+
+def bay_block_devices():
+    """{bay: 'sdX'}"""
+    return {bay: dev for bay, (dev, _) in bay_disks().items()}
+
+
+def led_target(present, dev, ata, dev_state):
+    """What a bay's LEDs should show: (green trigger, green brightness, orange brightness).
+
+    trigger "ataN": the kernel keeps the green LED on and blinks it off on every completed
+    ATA command of that port (CONFIG_ATA_LEDS); "none" = fixed brightness.
+    """
+    if not present:
+        return ("none", 0, 0)                    # empty bay
+    if not dev:
+        return ("none", 1, 0)                    # disk present, not yet probed: green steady
+    if dev_state not in (None, "running"):
+        return ("none", 0, 1)                    # error: orange
+    return (f"ata{ata}" if ata is not None else "none", 1, 0)
+
+
+def disk_asleep(dev):
+    """True if hdparm -C (CHECK POWER MODE, does not spin up) says standby/sleeping.
+
+    None when it cannot tell (no hdparm, error): the caller reads the disk anyway.
+    """
+    if not shutil.which("hdparm"):
+        return None
+    try:
+        r = subprocess.run(["hdparm", "-C", f"/dev/{dev}"], capture_output=True,
+                           text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r"drive state is:\s*(\S+)", r.stdout)
+    if not m:
+        return None
+    return m.group(1) in ("standby", "sleeping")
+
+
+def sensors(bays, last_disk=None):
+    """Temperatures; a spun-down bay disk keeps its last known value (no wake-up)."""
+    last_disk = {} if last_disk is None else last_disk
+    s = {"cpu": None, "disk": {}, "nvme": {}, "nic": {}, "asleep": []}
+    for d in hwmon_by_name("k10temp"):
+        s["cpu"] = hwmon_temp(d, "Tctl") or hwmon_temp(d)
+    for bay, dev in bays.items():
+        key = f"bay{bay}"
+        if disk_asleep(dev):
+            s["asleep"].append(key)
+            if last_disk.get(key) is not None:
+                s["disk"][key] = last_disk[key]
+            continue
+        for d in glob.glob(f"/sys/block/{dev}/device/hwmon/hwmon*"):   # drivetemp
+            t = hwmon_temp(d)
+            s["disk"][key] = t
+            if t is not None:
+                last_disk[key] = t
+    for d in hwmon_by_name("nvme"):
+        dev = os.path.basename(os.path.realpath(f"{d}/device"))
+        s["nvme"][dev] = hwmon_temp(d, "Composite") or hwmon_temp(d)
+    for name in ("atlantic", "aqc", "r8169"):
+        for d in hwmon_by_name(name):
+            dev = os.path.basename(os.path.realpath(f"{d}/device"))
+            t = hwmon_temp(d)
+            if t is not None:
+                s["nic"][dev] = t
+    return s
+
+
+class Fan:
+    def __init__(self, conf):
+        self.conf = conf
+        self.level = {}   # sensor class -> current step index (for hysteresis)
+
+    def step(self, cls, temp, table):
+        idx = 0
+        for i, (thr, _) in enumerate(table):
+            if temp >= thr:
+                idx = i
+        cur = self.level.get(cls, 0)
+        # slow down only past each step's threshold minus the hysteresis margin
+        if idx < cur:
+            for i in range(min(cur, len(table) - 1), idx, -1):
+                if temp > table[i][0] - self.conf["hysteresis"]:
+                    idx = i
+                    break
+        self.level[cls] = idx
+        return table[idx][1]
+
+    def duty(self, s):
+        if self.conf["fan_mode"] == "full":
+            return 99, None
+        t = FAN_TABLES.get(self.conf["fan_mode"], FAN_TABLES["low"])
+        duty, critical = self.conf["fan_min_duty"], None
+        groups = {
+            "disk": [v for v in s["disk"].values() if v is not None],
+            "nvme": [v for v in s["nvme"].values() if v is not None],
+            "cpu": [s["cpu"]] if s["cpu"] is not None else [],
+            "nic": [v for v in s["nic"].values() if v is not None],
+        }
+        for cls, temps in groups.items():
+            if not temps:
+                continue
+            hot = max(temps)
+            duty = max(duty, self.step(cls, hot, t[cls]))
+            if hot >= t[f"{cls}_shutdown"]:
+                critical = f"{cls} {hot:.0f}°C >= {t[cls + '_shutdown']}°C"
+        return min(duty, 99), critical
+
+
+class Thermal:
+    """Shutdown only when a threshold is exceeded in CRIT_READINGS readings in a row."""
+
+    def __init__(self):
+        self.streak = 0
+
+    def update(self, critical):
+        self.streak = self.streak + 1 if critical else 0
+        return self.streak >= CRIT_READINGS
+
+
+class FanHealth:
+    """fan_fail from the kernel alarms (2 cycles in a row) and the uP 'f'/'g' events."""
+
+    def __init__(self):
+        self.streak = 0
+        self.last_event = None
+
+    def event(self, now):
+        self.last_event = now
+
+    def update(self, alarms, now):
+        self.streak = self.streak + 1 if any(a == 1 for a in alarms) else 0
+        recent = self.last_event is not None and now - self.last_event < FAN_EVENT_HOLD
+        return self.streak >= FAN_ALARM_CYCLES or recent
+
+
+def synology_hwmon():
+    return sorted(glob.glob(f"{PLATFORM}/hwmon/hwmon*"))
+
+
+def int_or_none(v):
+    return int(v) if v is not None and v.lstrip("-").isdigit() else None
+
+
+class Daemon:
+    def __init__(self):
+        self.conf = load_conf()
+        self.up = MicroP(up_tty())
+        self.fan = Fan(self.conf)
+        self.thermal = Thermal()
+        self.fan_health = FanHealth()
+        self.state = {"fan_duty": None, "fans": [], "fan_fail": False,
+                      "up_current": None, "status_led": None, "events": []}
+        self.bays = {}
+        self.last_disk = {}
+        self.stop = threading.Event()
+        self.last_power_press = 0
+        self.shutting_down = False
+
+    def event(self, b):
+        if b == "0":
+            now = time.monotonic()
+            if now - self.last_power_press < 2:
+                return
+            self.last_power_press = now
+            self.note("power button")
+            self.button(self.conf["power_button"], ["systemctl", "poweroff"], "power button")
+        elif b == "a":
+            self.note("reset button")
+            self.button(self.conf["reset_button"], None)
+        elif b == "`":
+            self.note("usb copy button")
+        elif b in ("f", "g"):
+            self.note("fan failure" if b == "f" else "cpu fan failure")
+            if not self.state["fan_fail"]:
+                notify("fan failure", "reported by the microcontroller "
+                       f"({'fan' if b == 'f' else 'CPU fan'})", "urgent")
+            self.fan_health.event(time.monotonic())
+            self.state["fan_fail"] = True
+            if self.conf["beep_on_error"]:
+                self.up.send("3")
+        elif b.strip():
+            log.debug("uP byte %r", b)
+
+    def button(self, action, default_cmd, name=None):
+        if action == "ignore" or action == "log":
+            return
+        if action.startswith("command:"):
+            subprocess.Popen(action[8:], shell=True)
+        elif default_cmd:
+            self.up.send("3")          # long beep, as DSM on the power button
+            self.up.send("5")          # power LED blinks while shutting down
+            notify(f"shutdown: {name}", f"{name}: {' '.join(default_cmd)}", "high",
+                   then=default_cmd)
+
+    def note(self, what):
+        log.info("event: %s", what)
+        self.state["events"] = (self.state["events"] + [[time.strftime("%F %T"), what]])[-20:]
+
+    def raid_degraded(self):
+        md = read("/proc/mdstat", "")
+        return bool(re.search(r"\[[U_]*_[U_]*\]", md))
+
+    def set_status(self, code):
+        if self.state["status_led"] != code:
+            self.up.send(code)
+            self.state["status_led"] = code
+
+    def publish_pwm(self):
+        if self.state["fan_duty"] is None:
+            return
+        for d in synology_hwmon():
+            write(f"{d}/pwm1", round(self.state["fan_duty"] * 255 / 99))
+
+    def read_fans(self):
+        """[{fan, rpm, alarm}] from hwmon "synology" (tach GPIO 68/69, measured by the kernel)."""
+        fans = []
+        for d in synology_hwmon():
+            for n in (1, 2):
+                rpm = int_or_none(read(f"{d}/fan{n}_input"))
+                alarm = int_or_none(read(f"{d}/fan{n}_alarm"))
+                if rpm is not None or alarm is not None:
+                    fans.append({"fan": n, "rpm": rpm, "alarm": alarm})
+        return fans
+
+    def read_current(self):
+        r = self.up.query("D")
+        if r and r.isdigit():
+            # DSM system current sensor: value * 16 + value * 13 / 100 (unit unknown)
+            v = int(r)
+            self.state["up_current"] = 16 * v + 13 * v // 100
+
+    def update_fan_fail(self):
+        fans = self.read_fans()
+        self.state["fans"] = fans
+        was = self.state["fan_fail"]
+        fail = self.fan_health.update([f["alarm"] for f in fans], time.monotonic())
+        if fail and not was:
+            self.note("fan stopped (hwmon alarm)")
+            notify("fan failure", "fan stopped (hwmon alarm): "
+                   + ", ".join(f"fan{f['fan']} {f['rpm']} rpm" for f in fans), "urgent")
+            if self.conf["beep_on_error"]:
+                self.up.send("3")
+        elif was and not fail:
+            self.note("fans ok")
+            notify("fans ok again", "", "normal")
+        self.state["fan_fail"] = fail
+
+    def control_loop(self):
+        while not self.stop.is_set():
+            self.bays = bay_block_devices()
+            s = sensors(self.bays, self.last_disk)
+            duty, critical = self.fan.duty(s)
+            if duty != self.state["fan_duty"]:
+                self.up.send(f"V{duty:02d}")
+                log.info("fan duty %d%%", duty)
+                self.state["fan_duty"] = duty
+            self.publish_pwm()
+            self.read_current()
+            self.update_fan_fail()
+            problem = self.state["fan_fail"] or self.raid_degraded()
+            self.set_status(";" if problem else "8")
+            if critical:
+                log.warning("over the shutdown threshold: %s", critical)
+            if self.thermal.update(critical) and self.conf["thermal_shutdown"] \
+                    and not self.shutting_down:
+                self.shutting_down = True
+                self.note(f"thermal shutdown: {critical}")
+                self.up.send("3")
+                notify("thermal shutdown", critical, "urgent", then=["systemctl", "poweroff"])
+            self.write_status(s)
+            self.stop.wait(self.conf["fan_period"])
+
+    def write_status(self, s):
+        bays = {}
+        for n in range(1, 5):
+            bays[n] = {"present": read(f"{PLATFORM}/bay{n}_present") == "1",
+                       "power": read(f"{PLATFORM}/bay{n}_power") == "1",
+                       "device": self.bays.get(n)}
+        data = {"time": time.strftime("%F %T"), "epoch": int(time.time()),
+                "period": self.conf["fan_period"], "sensors": s, "bays": bays, **self.state}
+        tmp = STATUS + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=1)
+        os.replace(tmp, STATUS)
+
+    def apply_standby(self):
+        minutes = int(self.conf["disk_standby_minutes"])
+        if minutes <= 0:
+            return
+        # hdparm -S: 1..240 = n*5 s, 241..251 = (n-240)*30 min
+        val = min(240, minutes * 12) if minutes <= 20 else min(251, 240 + -(-minutes // 30))
+        for dev in bay_block_devices().values():
+            subprocess.run(["hdparm", "-q", "-S", str(val), f"/dev/{dev}"], check=False)
+            log.info("standby %s after %d min", dev, minutes)
+
+    def apply_wol(self):
+        mode = "g" if self.conf["wol"] else "d"
+        for n in glob.glob("/sys/class/net/lan*"):
+            subprocess.run(["ethtool", "-s", os.path.basename(n), "wol", mode], check=False)
+
+    def ac_recovery_cmd(self):
+        return "q" if self.conf["ac_recovery"] else "p"
+
+    def prepare_poweroff(self):
+        """Tell the uP what may wake the NAS once it is off (like DSM does)."""
+        alarm = False
+        for rtc in glob.glob("/sys/class/rtc/rtc*"):
+            if os.path.basename(os.path.realpath(f"{rtc}/device")).endswith("-0030"):  # S-35390A
+                alarm = bool(read(f"{rtc}/wakealarm"))
+        self.up.send("s" if alarm else "r")
+        self.up.send("l" if self.conf["wol"] else "k")
+        self.up.send(self.ac_recovery_cmd())
+        log.info("power-off: scheduled power-on %s, WOL %s, AC recovery %s",
+                 alarm, self.conf["wol"], self.conf["ac_recovery"])
+
+    def led(self, bay, color, value):
+        write(f"{LEDS}/syno:{color}:disk{bay}/brightness", value)
+
+    def apply_led(self, bay, target, on):
+        """Set one bay. The trigger is written before the brightness: writing 0 to
+        'brightness' detaches any trigger (Linux LED class), a non-zero value keeps it,
+        so dimming (led_brightness < 255) also works with the activity trigger."""
+        trig, green, orange = target
+        g = f"{LEDS}/syno:green:disk{bay}"
+        if trig != "none" and trig not in read(f"{g}/trigger", "").replace("[", " ").replace("]", " ").split():
+            log.warning("LED trigger %s missing (kernel without CONFIG_ATA_LEDS?): "
+                        "bay %d green steady", trig, bay)
+            trig = "none"
+        write(f"{g}/trigger", trig)
+        if trig == "none" or on != 255:
+            self.led(bay, "green", on if green else 0)
+        self.led(bay, "orange", on if orange else 0)
+
+    def led_step(self, shown, on):
+        disks = bay_disks()
+        for bay in range(1, 5):
+            dev, ata = disks.get(bay, (None, None))
+            present = read(f"{PLATFORM}/bay{bay}_present") == "1"
+            st = read(f"{SYS_BLOCK}/{dev}/device/state") if dev else None
+            target = led_target(present, dev, ata, st)
+            if shown.get(bay) != target:
+                self.apply_led(bay, target, on)
+                shown[bay] = target
+
+    def led_loop(self):
+        """Disk LEDs at 1 Hz: the I/O blinking is done by the kernel (trigger ataN)."""
+        on = max(1, min(255, int(self.conf["led_brightness"])))
+        if "led_activity_hz" in self.conf:
+            log.info("led_activity_hz is ignored: the kernel trigger ataN blinks the LEDs")
+        shown = {}
+        while not self.stop.is_set():
+            self.led_step(shown, on)
+            self.stop.wait(1)
+
+    def cmd_loop(self):
+        try:
+            os.mkfifo(CMD_FIFO, 0o600)
+        except FileExistsError:
+            pass
+        # O_RDWR: the daemon is a writer too, so the FIFO never hits EOF and
+        # 'synohwd send' (O_NONBLOCK) only gets ENXIO when the daemon is gone
+        fd = os.open(CMD_FIFO, os.O_RDWR)
+        buf = b""
+        while not self.stop.is_set():
+            r, _, _ = select.select([fd], [], [], 1.0)
+            if not r:
+                continue
+            buf += os.read(fd, 256)
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                cmd = line.decode("latin-1").strip()
+                if not cmd:
+                    continue
+                try:
+                    self.up.send(cmd)
+                    log.info("sent %r", cmd)
+                except ValueError as e:
+                    log.warning("%s", e)
+            buf = buf[-256:]
+
+    def start_thread(self, target, *args):
+        def run():
+            try:
+                target(*args)
+            except BaseException:
+                log.exception("thread %s died, exiting so that systemd restarts the daemon",
+                              target.__name__)
+                remove_status()
+                logging.shutdown()
+                os._exit(1)
+        threading.Thread(target=run, name=target.__name__, daemon=True).start()
+
+    def run(self):
+        os.makedirs(RUN_DIR, exist_ok=True)
+        signal.signal(signal.SIGTERM, lambda *_: self.stop.set())
+        self.start_thread(self.up.reader, self.event)
+        mpid = self.up.query("R")
+        log.info("microP id %r", mpid)
+        # boot finished, like DSM: fan check on, power LED steady, status green, long beep
+        self.up.send("u")
+        self.up.send("4")
+        self.set_status("8")
+        if self.conf["beep_on_start"]:
+            self.up.send("3")
+        self.up.send(self.ac_recovery_cmd())   # DSM RCPower.service
+        self.apply_standby()
+        self.apply_wol()
+        self.start_thread(self.cmd_loop)
+        if self.conf["disk_leds"]:
+            self.start_thread(self.led_loop)
+        try:
+            self.control_loop()
+        finally:
+            # 'C' (reboot) and '1' (power off) are sent by the kernel at the very end
+            self.prepare_poweroff()
+            self.up.send("t")        # fan-fail check off (DSM SynoDisableFanCheck)
+            self.up.send("5")        # shutting down: power LED blinks
+            self.up.send("7")
+            for bay in range(1, 5):
+                self.led(bay, "green", 0)        # 0 also detaches the ataN trigger
+                self.led(bay, "orange", 0)
+            remove_status()
+
+
+def remove_status():
+    for p in (STATUS, STATUS + ".tmp"):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- DS2415+ (model "ds2415p")
+# Synology DS2415+ (Atom C2538) with an optional DX1215 expansion unit. "ds2415p" and not
+# "ds2415": Synology sells non-plus models in this family that are different hardware.
+#
+# uP: 16550 at I/O 0x2F8 (ttyS1), 9600 8N1, ASCII. Bytes measured under DSM 7.1.1 (DSM's own
+# syno_microp_control with synobios logging): '2' short beep, '4' '5' '6' power LED on / blink /
+# off, '7' status off, '8' '9' green / blink, ':' ';' orange / blink, '@' 'A' 'B' USB LED,
+# 'LA1' 'LA2' 'LA3' alert LED on / blink / off, 'LE1..3' eSATA LED, 'V<nn>' fan duty %,
+# 'W20' fan PWM 20 Hz, 'l' 'k' WOL, 'q' 'p' AC recovery, 's' 'r' scheduled power-on, 'u' 't'
+# fan checker on / off (DSM's scemd sends 'u' about every 10 s), 'O' version. Never measured
+# and never sent, refused by ds2415p_check_cmd: '1' (power off), 'C' (reset), '3' (long beep)
+# and V below 10. The uP streams '3' and 'K' about 4 times a second; what they mean, and the
+# power button byte, are not known: incoming bytes are only logged.
+# Fans: DS2415+ duty from the scemd.xml tables (disk, cpu), no tachometer. DX1215 fans: hwmon
+# "synology_dx1215" (kernel synology_ds2415p), pwm1 255 full / 128 middle / 64 low, from
+# DSM's DX1215 table on the hottest DX1215 disk; fan1_alarm / fan2_alarm.
+# Bays: DS bay = 4 * (88SE9215 index in PCI order) + port + 1; DX1215 bay = 3 * EMID +
+# fan-out port + 1 (EMID per 88SE9235 lane: dx_ports of the platform device). Green LEDs are
+# hardware (link/activity); the daemon drives the orange ones: syno:orange:diskN and
+# syno-dx1:orange:diskN, on for a disk in error.
+DS2415P_PLATFORM = "/sys/devices/platform/synology-ds2415p"
+DS2415P_UP_PORT = 0x2F8
+SYS_PCI = "/sys/bus/pci/devices"
+SYS_TTY = "/sys/class/tty"
+SYS_RTC = "/sys/class/rtc"
+DMI_ID = "/sys/class/dmi/id"
+DS2415P_KEEPALIVE = 10          # s between 'u' (DSM's scemd)
+DS2415P_REASSERT = 300          # s: the duty and the DX1215 level are sent again this often
+DS2415P_UNREADABLE_DUTY = 70    # a temperature source cannot be read
+DS2415P_NO_DATA_DUTY = 99       # no temperature at all
+DS2415P_SAFE = re.compile(r"[2,.456789:;@ABlkqpsrutO]|L[AE][123]|W20|V[1-9][0-9]")
+
+# scemd.xml of the DS2415+ (DSM 7.1.1), as (threshold °C, duty %). The *_alert row lights the
+# alert LED (action ALERT_LED), the *_shutdown one powers off (action SHUTDOWN).
+DS2415P_FAN_TABLES = {
+    "high": {  # DUAL_MODE_HIGH
+        "disk": [(0, 20), (41, 40), (45, 70), (49, 99)], "disk_alert": 53, "disk_shutdown": 61,
+        "cpu": [(0, 20), (65, 70), (85, 99)], "cpu_alert": 85, "cpu_shutdown": 95,
+    },
+    "low": {  # DUAL_MODE_LOW (DSM default)
+        "disk": [(0, 20), (46, 40), (50, 70), (54, 99)], "disk_alert": 58, "disk_shutdown": 61,
+        "cpu": [(0, 20), (65, 70), (85, 99)], "cpu_alert": 85, "cpu_shutdown": 95,
+    },
+}
+# scemd.xml, Synology-DX1215 (HIGH and LOW tables are the same); 61 °C = action SHUTDOWN.
+# Disks asleep: LOW (hibernation_speed). The level is never "stop" (the kernel refuses it too).
+DX1215_TABLE = [(0, "low"), (48, "middle"), (55, "full")]
+DX1215_SHUTDOWN = 61
+DX1215_PWM = {"low": 64, "middle": 128, "full": 255}
+DX1215_RANK = {"low": 0, "middle": 1, "full": 2}
+
+
+def ds2415p_check_cmd(cmd):
+    """One command from the measured DS2415+ list; never '1', 'C', '3' or V below 10."""
+    if not cmd:
+        raise ValueError("empty command")
+    if not DS2415P_SAFE.fullmatch(cmd):
+        raise ValueError(f"{cmd!r}: not a DS2415+ command this daemon sends, refused")
+
+
+def ds2415p_up_tty():
+    """/dev node of the uP UART (16550 at I/O port 0x2F8)."""
+    if os.path.exists("/dev/synology-up"):
+        return "/dev/synology-up"
+    for t in sorted(glob.glob(f"{SYS_TTY}/ttyS*")):
+        v = read(f"{t}/port")
+        try:
+            if v and int(v, 16) == DS2415P_UP_PORT:
+                return "/dev/" + os.path.basename(t)
+        except ValueError:
+            pass
+    raise SystemExit(f"uP UART (I/O port {DS2415P_UP_PORT:#x}) not found")
+
+
+def board_model(conf):
+    """'ds2415p' or 'ds923' (the default): conf "model", else what the system looks like."""
+    m = conf.get("model", "auto")
+    if m in ("ds923", "ds2415p"):
+        return m
+    if os.path.isdir(DS2415P_PLATFORM):
+        return "ds2415p"
+    if (read(f"{DMI_ID}/sys_vendor") == "Insyde" and read(f"{DMI_ID}/product_name") == "MohonPeak"
+            and read(f"{SYS_PCI}/0000:00:1f.0/vendor") == "0x8086"
+            and read(f"{SYS_PCI}/0000:00:1f.0/device") == "0x1f38"):
+        return "ds2415p"
+    return "ds923"
+
+
+def model_check_cmd(conf):
+    return ds2415p_check_cmd if board_model(conf) == "ds2415p" else check_cmd
+
+
+def ds2415p_bay_disks():
+    """({DS bay: ('sdX', ata)}, {DX1215 bay: ('sdX', ata)})."""
+    ctrls = [os.path.basename(p) for p in sorted(glob.glob(f"{SYS_PCI}/*"))
+             if read(f"{p}/vendor") == "0x1b4b" and read(f"{p}/device") == "0x9215"]
+    emid = {}
+    for line in (read(f"{DS2415P_PLATFORM}/dx_ports") or "").splitlines():
+        m = re.fullmatch(r"ata(\d+) (\d+)", line.strip())
+        if m:
+            emid[int(m.group(1))] = int(m.group(2))
+    ds, dx = {}, {}
+    for blk in glob.glob(f"{SYS_BLOCK}/sd*"):
+        path = os.path.realpath(f"{blk}/device")
+        m = re.search(r"/ata(\d+)/", path)
+        if not m:
+            continue
+        ata, dev = int(m.group(1)), os.path.basename(blk)
+        for i, c in enumerate(ctrls):
+            if f"/{c}/" not in path:
+                continue
+            top = path.split(f"/ata{ata}/")[0]
+            ports = sorted(int(os.path.basename(p)[3:]) for p in glob.glob(f"{top}/ata*")
+                           if os.path.basename(p)[3:].isdigit())
+            if ata in ports and ports.index(ata) < 4:
+                ds[4 * i + ports.index(ata) + 1] = (dev, ata)
+        t = re.search(r"/target\d+:(\d+):\d+/", path)      # SCSI channel = PMP fan-out port
+        if ata in emid and t and int(t.group(1)) < 3:
+            dx[3 * emid[ata] + int(t.group(1)) + 1] = (dev, ata)
+    return ds, dx
+
+
+def ds2415p_sensors(bays, dx_bays, last_disk):
+    """Temperatures; a spun-down disk keeps its last value; None = awake, no reading."""
+    s = {"cpu": None, "disk": {}, "dx": {}, "nvme": {}, "nic": {}, "asleep": []}
+    for d in hwmon_by_name("coretemp"):
+        t = hwmon_temp(d)
+        if t is not None:
+            s["cpu"] = t if s["cpu"] is None else max(s["cpu"], t)
+    for group, prefix, disks in (("disk", "bay", bays), ("dx", "dx", dx_bays)):
+        for bay, (dev, _) in disks.items():
+            key = f"{prefix}{bay}"
+            if disk_asleep(dev):
+                s["asleep"].append(key)
+                if last_disk.get(key) is not None:
+                    s[group][key] = last_disk[key]
+                continue
+            t = None
+            for d in glob.glob(f"{SYS_BLOCK}/{dev}/device/hwmon/hwmon*"):   # drivetemp
+                t = hwmon_temp(d)
+            s[group][key] = t
+            if t is not None:
+                last_disk[key] = t
+    return s
+
+
+class DS2415PFan(Fan):
+    def duty(self, s):
+        """(duty %, critical or None, alert band reached)"""
+        if self.conf["fan_mode"] == "full":
+            return 99, None, False
+        t = DS2415P_FAN_TABLES.get(self.conf["fan_mode"], DS2415P_FAN_TABLES["low"])
+        disks = [v for v in s["disk"].values() if v is not None]
+        unread = any(v is None for v in s["disk"].values())
+        groups = {"disk": disks, "cpu": [s["cpu"]] if s["cpu"] is not None else []}
+        duty, critical, alert = int(self.conf["fan_min_duty"]), None, False
+        for cls, temps in groups.items():
+            if not temps:
+                continue
+            hot = max(temps)
+            duty = max(duty, self.step(cls, hot, t[cls]))
+            alert = alert or hot >= t[f"{cls}_alert"]
+            if hot >= t[f"{cls}_shutdown"]:
+                critical = f"{cls} {hot:.0f}°C >= {t[cls + '_shutdown']}°C"
+        if s["cpu"] is None or unread:
+            duty = max(duty, DS2415P_UNREADABLE_DUTY)
+        if s["cpu"] is None and not disks:
+            duty = DS2415P_NO_DATA_DUTY
+        return min(max(duty, 10), 99), critical, alert
+
+
+def dx1215_level(fan, conf, s, alarm):
+    """(level, why, critical) for the DX1215 fans; alarm = a fan alarm is set or unreadable."""
+    temps = [v for v in s["dx"].values() if v is not None]
+    unread = any(v is None for v in s["dx"].values())
+    asleep = any(a.startswith("dx") for a in s["asleep"])
+    critical = None
+    if conf["fan_mode"] == "full":
+        level, why = "full", "fan_mode full"
+    elif temps:
+        level, why = fan.step("dx", max(temps), DX1215_TABLE), "table"
+    elif asleep:
+        level, why = "low", "disks asleep"
+    elif unread:
+        level, why = "middle", "no reading"
+    else:
+        level, why = "middle", "no DX1215 disk"
+    if unread and DX1215_RANK[level] < DX1215_RANK["middle"]:
+        level, why = "middle", "no reading"
+    if temps and max(temps) >= DX1215_SHUTDOWN:
+        level, why = "full", "shutdown threshold"
+        critical = f"DX1215 disk {max(temps):.0f}°C >= {DX1215_SHUTDOWN}°C"
+    if alarm:
+        level, why = "full", "fan alarm"
+    return level, why, critical
+
+
+def dx1215_hwmon():
+    """hwmon dirs of the DX1215 (child of the synology-ds2415p platform device)"""
+    return sorted(d for d in glob.glob(f"{DS2415P_PLATFORM}/hwmon/hwmon*")
+                  if read(f"{d}/name") == "synology_dx1215")
+
+
+class DS2415PDaemon(Daemon):
+    """DS2415+ (+ DX1215): uP on ttyS1, bay LEDs and DX1215 through synology_ds2415p."""
+
+    def __init__(self):
+        self.conf = load_conf()
+        self.up = MicroP(ds2415p_up_tty(), check=ds2415p_check_cmd)
+        self.init_state()
+
+    def init_state(self):
+        self.fan = DS2415PFan(self.conf)
+        self.dx_fan = Fan(self.conf)
+        self.thermal = Thermal()
+        self.state = {"fan_duty": None, "fans": [], "fan_fail": False, "status_led": None,
+                      "alert_led": None, "dx": None, "events": []}
+        self.bays, self.dx_bays, self.last_disk = {}, {}, {}
+        self.stop = threading.Event()
+        self.shutting_down = False
+        self.seen = set()
+        self.duty_at = self.dx_at = 0.0
+
+    def event(self, b):
+        # meaning unknown (the uP streams '3' and 'K'): logged, never acted on
+        if b not in self.seen:
+            self.seen.add(b)
+            log.info("uP byte %r (first seen)", b)
+
+    def keepalive_loop(self):
+        while not self.stop.is_set():
+            self.up.send("u")
+            self.stop.wait(DS2415P_KEEPALIVE)
+
+    def set_alert(self, on):
+        if self.state["alert_led"] != on:
+            self.up.send("LA1" if on else "LA3")
+            self.state["alert_led"] = on
+
+    def send_duty(self, duty, now):
+        if duty != self.state["fan_duty"] or now - self.duty_at >= DS2415P_REASSERT:
+            self.up.send(f"V{duty:02d}")
+            if duty != self.state["fan_duty"]:
+                log.info("fan duty %d%%", duty)
+            self.state["fan_duty"], self.duty_at = duty, now
+
+    def dx_step(self, s, now):
+        """DX1215 fans: read the alarms and the level, write pwm1 when needed. -> critical"""
+        hw = dx1215_hwmon()
+        if not hw:
+            self.state["dx"] = None
+            return None
+        d = hw[0]
+        a = [int_or_none(read(f"{d}/fan{n}_alarm")) for n in (1, 2)]
+        pwm = int_or_none(read(f"{d}/pwm1"))
+        if pwm is None and a == [None, None]:
+            # the unit does not answer (switched off, cable out): nothing to drive
+            if (self.state["dx"] or {}).get("why") != "unavailable":
+                self.note("DX1215 not answering")
+            self.state["dx"] = {"level": None, "want": None, "why": "unavailable",
+                                "alarm": False, "alarms": a, "switch": None}
+            return None
+        cur = {v: k for k, v in DX1215_PWM.items()}.get(pwm)
+        alarm = any(x != 0 for x in a)              # an alarm that cannot be read counts
+        want, why, critical = dx1215_level(self.dx_fan, self.conf, s, alarm)
+        was = (self.state["dx"] or {}).get("alarm", False)
+        if alarm and not was:
+            self.note(f"DX1215 fan alarm {a}")
+            notify("DX1215 fan failure", f"fan alarms {a}: DX1215 fans to full", "urgent")
+            if self.conf["beep_on_error"]:
+                self.up.send("2")
+        elif was and not alarm:
+            self.note("DX1215 fans ok")
+        if want != cur or now - self.dx_at >= DS2415P_REASSERT:
+            if write(f"{d}/pwm1", DX1215_PWM[want]):
+                if want != cur:
+                    log.info("DX1215 fans %s -> %s (%s)", cur, want, why)
+                cur = want
+            else:
+                log.warning("DX1215: writing pwm1=%d failed", DX1215_PWM[want])
+            self.dx_at = now
+        self.state["dx"] = {"level": cur, "want": want, "why": why, "alarm": alarm,
+                            "alarms": a, "switch": read(f"{DS2415P_PLATFORM}/dx_switch")}
+        return critical
+
+    def control_loop(self):
+        while not self.stop.is_set():
+            self.control_step(time.monotonic())
+            self.stop.wait(self.conf["fan_period"])
+
+    def control_step(self, now):
+        self.bays, self.dx_bays = ds2415p_bay_disks()
+        s = ds2415p_sensors(self.bays, self.dx_bays, self.last_disk)
+        duty, critical, alert = self.fan.duty(s)
+        self.send_duty(duty, now)
+        critical = self.dx_step(s, now) or critical
+        self.state["fan_fail"] = bool(self.state["dx"] and self.state["dx"]["alarm"])
+        problem = self.state["fan_fail"] or self.raid_degraded()
+        self.set_status(";" if problem or alert else "8")
+        self.set_alert(alert)
+        if critical:
+            log.warning("over the shutdown threshold: %s", critical)
+        if self.thermal.update(critical) and self.conf["thermal_shutdown"] \
+                and not self.shutting_down:
+            self.shutting_down = True
+            self.note(f"thermal shutdown: {critical}")
+            self.up.send("2")
+            notify("thermal shutdown", critical, "urgent", then=["systemctl", "poweroff"])
+        self.write_status(s)
+
+    def write_status(self, s):
+        bays = {}
+        for n in range(1, 13):
+            dev = self.bays.get(n, (None,))[0]
+            bays[str(n)] = {"present": dev is not None, "device": dev}
+        if self.state["dx"] is not None:
+            for n in range(1, 13):
+                dev = self.dx_bays.get(n, (None,))[0]
+                bays[f"dx{n}"] = {"present": dev is not None, "device": dev}
+        data = {"time": time.strftime("%F %T"), "epoch": int(time.time()),
+                "period": self.conf["fan_period"], "sensors": s, "bays": bays, **self.state}
+        tmp = STATUS + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=1)
+        os.replace(tmp, STATUS)
+
+    def bay_devices(self):
+        ds, dx = ds2415p_bay_disks()
+        return [dev for dev, _ in list(ds.values()) + list(dx.values())]
+
+    def apply_standby(self):
+        minutes = int(self.conf["disk_standby_minutes"])
+        if minutes <= 0:
+            return
+        val = min(240, minutes * 12) if minutes <= 20 else min(251, 240 + -(-minutes // 30))
+        for dev in self.bay_devices():
+            subprocess.run(["hdparm", "-q", "-S", str(val), f"/dev/{dev}"], check=False)
+            log.info("standby %s after %d min", dev, minutes)
+
+    def apply_wol(self):
+        # no lan* names here: every physical NIC (igb)
+        mode = "g" if self.conf["wol"] else "d"
+        for n in glob.glob("/sys/class/net/*/device"):
+            subprocess.run(["ethtool", "-s", n.split("/")[-2], "wol", mode], check=False)
+
+    def prepare_poweroff(self):
+        """Tell the uP what may wake the NAS (as DSM). The RTC is rtc_cmos (rtc0)."""
+        alarm = any(read(f"{r}/wakealarm") for r in glob.glob(f"{SYS_RTC}/rtc*"))
+        self.up.send("s" if alarm else "r")
+        self.up.send("l" if self.conf["wol"] else "k")
+        self.up.send(self.ac_recovery_cmd())
+        log.info("power-off: scheduled power-on %s, WOL %s, AC recovery %s",
+                 alarm, self.conf["wol"], self.conf["ac_recovery"])
+
+    def leds_target(self):
+        """{led name: 0/1}: orange = the disk is in error (green is hardware)."""
+        out = {}
+        for prefix, disks in (("syno", self.bays), ("syno-dx1", self.dx_bays)):
+            for n in range(1, 13):
+                dev = disks.get(n, (None,))[0]
+                st = read(f"{SYS_BLOCK}/{dev}/device/state") if dev else None
+                out[f"{prefix}:orange:disk{n}"] = int(st not in (None, "running"))
+        return out
+
+    def led_step(self, shown, on):
+        self.bays, self.dx_bays = ds2415p_bay_disks()
+        for name, v in self.leds_target().items():
+            if shown.get(name) != v and os.path.isdir(f"{LEDS}/{name}"):
+                write(f"{LEDS}/{name}/brightness", v)
+                shown[name] = v
+
+    def startup(self):
+        # boot finished, as DSM: fan checker on, power LED on, status green, fan PWM 20 Hz
+        for c in ("u", "4", "8", "W20"):
+            self.up.send(c)
+        self.state["status_led"] = "8"
+        if self.conf["beep_on_start"]:
+            self.up.send("2")
+        self.up.send(self.ac_recovery_cmd())   # DSM RCPower
+
+    def shutdown(self):
+        self.prepare_poweroff()
+        self.up.send("V99")      # nobody adjusts the fans any more
+        self.up.send("t")        # fan checker off (DSM SynoDisableFanCheck)
+        self.up.send("5")        # shutting down: power LED blinks
+        self.up.send("7")
+        if self.state["alert_led"]:
+            self.up.send("LA3")
+        for d in dx1215_hwmon():
+            write(f"{d}/pwm1", DX1215_PWM["full"])
+        for name in self.leds_target():
+            write(f"{LEDS}/{name}/brightness", 0)
+
+    def run(self):
+        os.makedirs(RUN_DIR, exist_ok=True)
+        signal.signal(signal.SIGTERM, lambda *_: self.stop.set())
+        self.start_thread(self.up.reader, self.event)
+        self.startup()
+        self.apply_standby()
+        self.apply_wol()
+        self.start_thread(self.keepalive_loop)
+        self.start_thread(self.cmd_loop)
+        if self.conf["disk_leds"]:
+            self.start_thread(self.led_loop)
+        try:
+            self.control_loop()
+        finally:
+            self.shutdown()
+            remove_status()
+
+
+def status():
+    try:
+        with open(STATUS) as f:
+            d = json.load(f)
+    except OSError:
+        raise SystemExit("synohwd is not running (no /run/synohwd/status.json)")
+    s = d["sensors"]
+    age = time.time() - d.get("epoch", time.time())
+    stale = "  (STALE: the daemon is not updating)" if age > 3 * d.get("period", 20) + 10 else ""
+    print(f"updated      {d['time']}{stale}")
+    print(f"fans         duty {d['fan_duty']}%{'  FAILURE' if d['fan_fail'] else ''}")
+    for f in d.get("fans", []):
+        print(f"fan {f['fan']}        {f['rpm'] if f['rpm'] is not None else '?'} rpm"
+              f"{'  STOPPED' if f['alarm'] == 1 else ''}")
+    if d.get("up_current") is not None:
+        print(f"uP current   {d['up_current']} (unit unknown)")
+    dx = d.get("dx")
+    if dx:
+        print(f"DX1215       fans {dx['level'] or '?'} (wanted {dx['want']}: {dx['why']})"
+              f"{'  ALARM' if dx['alarm'] else ''}  switch {dx['switch'] or '?'}")
+    print(f"CPU          {s['cpu']} °C")
+    for k, v in s["nvme"].items():
+        print(f"NVMe {k:7} {v} °C")
+    for k, v in s["nic"].items():
+        print(f"NIC {k}  {v} °C")
+    for n, b in d["bays"].items():
+        t = s["disk"].get(f"bay{n}", s.get("dx", {}).get(n))      # "dxN": DX1215 bays
+        sleep = "  standby" if f"bay{n}" in s.get("asleep", []) or n in s.get("asleep", []) else ""
+        power = "" if "power" not in b else f"power {'on' if b['power'] else 'off'}  "
+        print(f"bay {n:<8} {'disk' if b['present'] else 'empty'}  "
+              f"{power}{b['device'] or ''}  "
+              f"{'' if t is None else f'{t} °C'}{sleep}")
+    for when, what in d["events"][-5:]:
+        print(f"event        {when} {what}")
+
+
+def send(cmd, check=check_cmd):
+    try:
+        check(cmd)
+    except ValueError as e:
+        raise SystemExit(f"refused: {e}")
+    try:
+        fd = os.open(CMD_FIFO, os.O_WRONLY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        raise SystemExit("synohwd is not running (no FIFO /run/synohwd/cmd)")
+    except OSError as e:
+        if e.errno == errno.ENXIO:
+            raise SystemExit("synohwd is not running (nobody reads /run/synohwd/cmd)")
+        raise SystemExit(f"{CMD_FIFO}: {e.strerror}")
+    try:
+        os.write(fd, (cmd + "\n").encode())
+    finally:
+        os.close(fd)
+
+
+def main():
+    logging.basicConfig(level=os.environ.get("SYNOHWD_LOG", "INFO"),
+                        format="%(levelname)s %(message)s")
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
+    if cmd == "run":
+        (DS2415PDaemon if board_model(load_conf()) == "ds2415p" else Daemon)().run()
+    elif cmd == "status":
+        status()
+    elif cmd == "send" and len(sys.argv) == 3:
+        send(sys.argv[2], model_check_cmd(load_conf()))
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

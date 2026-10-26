@@ -1,0 +1,17 @@
+# synohwd — configuration for the DS2415+ (defaults shown commented out)
+model = "ds2415p"          # ds2415p | ds923 | auto (auto recognises the DS2415+ too)
+# fan_mode = "low"          # low = DSM default table, high = DSM's cooler table, full = 99%
+#                           # (the DX1215 fans follow DSM's DX1215 table; full = full there too)
+# fan_period = 20           # seconds between adjustments
+# fan_min_duty = 0          # floor for the duty from the tables (the tables start at 20 %)
+# hysteresis = 3            # °C a sensor must drop below a step to slow down
+# thermal_shutdown = true   # power off at the DSM thresholds (disks 61°C, CPU 95°C, DX1215 disks 61°C)
+# beep_on_start = true      # short beep ('2'; the long beep '3' is never sent on this model)
+# beep_on_error = true
+# disk_leds = true          # orange bay LED for a disk in error (green = activity, in hardware)
+# disk_standby_minutes = 0  # e.g. 20: spin the disks down after 20 minutes of inactivity
+# wol = false               # Wake-on-LAN on all NICs
+# ac_recovery = true        # power back on after a power failure (like DSM, enableRCPower=yes)
+# power_button / reset_button: not used here, the microcontroller's button bytes are not known
+# scheduled power-on: rtcwake -d rtc0 -m no -t <epoch>  (rtc_cmos; the daemon tells the
+# microcontroller at shutdown)

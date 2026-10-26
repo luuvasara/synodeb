@@ -1,0 +1,21 @@
+[Unit]
+Description=Synology DS2415+ hardware daemon (fans, LEDs, DX1215, beep)
+After=systemd-modules-load.service systemd-udevd.service
+Wants=systemd-modules-load.service
+# the DS2415+ BIOS (placeholder DMI strings, as the kernel driver checks)
+ConditionFirmware=smbios-field(sys_vendor = Insyde)
+ConditionFirmware=smbios-field(product_name = MohonPeak)
+ConditionPathExists=/dev/synology-up
+# fans and LEDs also in UPS Safe Mode
+IgnoreOnIsolate=yes
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/synohwd run
+Restart=always
+RestartSec=3
+# with the daemon stopped nobody adjusts the fans: DS2415+ to 99 %, DX1215 to full
+ExecStopPost=/bin/sh -c 'stty -F /dev/synology-up 9600 raw -echo 2>/dev/null; printf V99 > /dev/synology-up; for f in /sys/devices/platform/synology-ds2415p/hwmon/hwmon*/pwm1; do [ -w "$$f" ] && echo 255 > "$$f"; done; exit 0'
+
+[Install]
+WantedBy=multi-user.target

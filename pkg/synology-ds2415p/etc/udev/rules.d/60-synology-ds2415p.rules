@@ -1,0 +1,5 @@
+# UARTs identified by I/O port (serial_core port attribute, "0x%lX"):
+# front microcontroller (16550 at 0x2F8, ttyS1) -> /dev/synology-up
+SUBSYSTEM=="tty", KERNEL=="ttyS*", ATTR{port}=="0x2F8", SYMLINK+="synology-up", MODE="0600"
+# serial console (16550 at 0x3F8, ttyS0, the rear DB-9) -> /dev/synology-console
+SUBSYSTEM=="tty", KERNEL=="ttyS*", ATTR{port}=="0x3F8", SYMLINK+="synology-console"

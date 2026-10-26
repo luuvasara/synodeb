@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ]; then
+    udevadm control --reload || true
+    udevadm trigger --subsystem-match=tty --action=add || true
+    modprobe synology_ds2415p 2>/dev/null || true
+    systemctl daemon-reload || true
+    systemctl enable synohwd.service || true
+fi
