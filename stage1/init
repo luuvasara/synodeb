@@ -3,7 +3,7 @@
 # the real system and kexec into it, so that kernel updates never write the DOM.
 #
 # Kernel command line (all optional):
-#   stage1.order=usb,disks      sources, in this order (default)
+#   stage1.order=usb,disks,dsm  sources, in this order (default)
 #   stage1.usbwait=10           seconds a USB stick gets before the next source is tried
 #   stage1.settle=30            seconds the disks get (md arrays, slow expansion units)
 #   stage1.dom=f400:f400        USB vendor:product of the DOM: made read-only, never a source
@@ -13,6 +13,7 @@
 # usb and disks: the first filesystem with stage2/stage2.conf, a file of three lines
 #   KERNEL=<path>  INITRD=<path>  CMDLINE="<kernel command line>"   (paths in that filesystem)
 # is booted. Renaming stage2/ (e.g. to stage2.off) disables a source.
+# dsm: DSM's own kernel from the DOM, only if the disks hold a DSM system (see dsm_boot).
 export PATH=/bin:/sbin
 mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev
 exec </dev/console >/dev/console 2>&1
@@ -22,7 +23,7 @@ arg() { # name default
     v=$(tr ' ' '\n' < /proc/cmdline | sed -n "s/^stage1\.$1=//p" | tail -n 1)
     echo "${v:-$2}"
 }
-ORDER=$(arg order usb,disks | tr , ' ')
+ORDER=$(arg order usb,disks,dsm | tr , ' ')
 USBWAIT=$(arg usbwait 10)
 SETTLE=$(arg settle 30)
 DOM_ID=$(arg dom f400:f400)
@@ -86,8 +87,61 @@ try_boot() {
     done
 }
 
+# DSM, the last resort: DSM's kernel and ramdisk from the DOM, with the command line of the
+# SYNOLOGY_2 entry of a GRUB 0.97 SynoBootLoader.conf plus what GRUB's `vender /vender show`
+# adds (macs=, sn=; vender layout: 4 x (6-byte MAC + 1 check byte), "SN=<serial>,CHK=<n>" at
+# offset 32, as on the DS2415+).
+# DSM's 3.10 kernel dies in efi_init when it gets EFI state after kexec, so it must boot as a
+# non-EFI kernel: stage-1 runs with `noefi` (no EFI runtime services) and `kexec -s` then
+# builds boot_params without efi_info; DSM finds ACPI through acpi_rsdp= instead.
+# Only when the disks hold a DSM system: DSM's installer takes partitions 1 and 2 of every
+# disk as its system and swap arrays and formats them, whatever they hold. DSM's system array
+# is md 0.90 on partition 1, superblock 64 KiB-aligned at the end, big-endian on some
+# platforms (either byte order is accepted).
+dsm_on_disks() {
+    for b in /sys/block/sd* /sys/block/nvme*; do
+        [ -e "$b" ] || continue
+        n=${b##*/}
+        for d in $DOM; do [ "$n" = "$d" ] && continue 2; done
+        on_usb "$n" && continue
+        case $n in nvme*) p=${n}p1 ;; *) p=${n}1 ;; esac
+        [ -r "/sys/class/block/$p/size" ] || continue
+        off=$(( ($(cat "/sys/class/block/$p/size") / 128 * 128 - 128) / 8 ))   # 4 KiB blocks
+        [ $off -gt 0 ] || continue
+        m=$(dd if="/dev/$p" bs=4096 skip=$off count=1 2>/dev/null | od -A n -t x1 -N 4 | tr -d ' \n')
+        case $m in a92b4efc|fc4e2ba9) echo "stage1: DSM system array on /dev/$p"; return 0 ;; esac
+    done
+    return 1
+}
+dsm_boot() {
+    grep -qw noefi /proc/cmdline || { echo "stage1: DSM needs stage-1 booted with noefi; skipped"; return; }
+    dsm_on_disks || { echo "stage1: no DSM system on the disks; DSM not started (its installer would format them)"; return; }
+    RSDP=$(sed -n 's/^ACPI20=//p' /sys/firmware/efi/systab 2>/dev/null)
+    for n in $DOM; do
+        mount -o ro "/dev/${n}1" /mnt 2>/dev/null || continue
+        P='' ARGS=''
+        eval "$(awk '/^title/ { e = $2 }
+            e == "SYNOLOGY_2" && $1 == "root" { print "P=" substr($2, 6, 1) + 1 }
+            e == "SYNOLOGY_2" && $1 == "kernel" { $1 = ""; $2 = ""; sub(/^ +/, ""); print "ARGS=\"" $0 "\"" }' \
+            /mnt/EFI/boot/SynoBootLoader.conf 2>/dev/null)"
+        umount /mnt
+        [ -n "$P" ] && [ -n "$ARGS" ] || { echo "stage1: no GRUB 0.97 SYNOLOGY_2 entry on /dev/${n}1"; continue; }
+        mount -o ro "/dev/$n$P" /mnt 2>/dev/null || continue
+        MACS=$(od -A n -t x1 -N 28 /mnt/vender 2>/dev/null | tr -d ' \n' |
+            sed 's/\(............\)../\1,/g; s/,$//; s/,*000000000000//g')
+        SN=$(dd if=/mnt/vender bs=1 skip=32 count=32 2>/dev/null | tr -d '\0' | sed -n 's/^SN=\([^,]*\).*/\1/p')
+        CMDLINE="$ARGS${MACS:+ macs=$MACS}${SN:+ sn=$SN}${RSDP:+ acpi_rsdp=$RSDP}"
+        echo "stage1: DSM on /dev/$n$P"
+        if kexec -s -l /mnt/zImage --initrd=/mnt/rd.gz --command-line="$CMDLINE"; then
+            umount /mnt; led 4; kexec -e
+        fi
+        echo "stage1: DSM kexec failed"; umount /mnt
+    done
+}
+
 # A source is tried once every source before it has had its wait (usb: usbwait, disks:
-# settle): a stick that is plugged in wins within seconds, the disks come next. Polling, not a fixed sleep: the first source that is there boots at once.
+# settle, dsm: none): a stick that is plugged in wins within seconds, the disks come next,
+# DSM last. Polling, not a fixed sleep: the first source that is there boots at once.
 wait_of() { case $1 in usb) echo "$USBWAIT" ;; disks) echo "$SETTLE" ;; *) echo 0 ;; esac; }
 scan() {
     mdev -s 2>/dev/null; protect_dom
@@ -107,7 +161,7 @@ while :; do
     gate=0
     for src in $ORDER; do
         [ $t -ge $gate ] || break
-        try_boot "$src"
+        case $src in usb|disks) try_boot "$src" ;; dsm) dsm_boot ;; esac
         w=$(wait_of "$src"); [ "$w" -gt $gate ] && gate=$w
     done
     [ $t -ge $gate ] && break   # every source has been tried after its wait

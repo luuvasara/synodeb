@@ -13,7 +13,7 @@ with a DX1215 expansion unit; the DS923+ boot is not changed by anything here.
 
 ```
 BIOS -> Synology GRUB (DOM) -> stage-1 kernel + initrd (DOM, read only)
-     -> kexec -> the first stage-2 found: USB stick, then the disks
+     -> kexec -> the first stage-2 found: USB stick, then the disks, then DSM
 ```
 
 A **stage-2** is any filesystem with `stage2/stage2.conf`:
@@ -32,7 +32,7 @@ Order and waits (kernel command line of the stage-1 entry):
 
 | parameter | default | |
 |---|---|---|
-| `stage1.order=` | `usb,disks` | sources in this order |
+| `stage1.order=` | `usb,disks,dsm` | sources in this order |
 | `stage1.usbwait=` | `10` | seconds a USB stick gets before the disks are tried |
 | `stage1.settle=` | `30` | seconds the disks get (md arrays, slow expansion units) |
 | `stage1.dom=` | `f400:f400` | USB vendor:product of the DOM |
@@ -55,6 +55,28 @@ Safety rules in `init`:
   --readonly`): a missing disk or a switched-off expansion unit does not block the boot.
 - **md members are never mounted.** With metadata 0.90 or 1.0 (superblock at the end) the
   filesystem is visible on each member too; a device with holders is skipped.
+
+## DSM as the last resort
+
+`dsm` in the order boots DSM's own kernel and ramdisk from the DOM by kexec, when nothing
+else was found. It needs two things, both learnt the hard way:
+
+- **stage-1 must run with `noefi`.** DSM's 3.10 kernel dies in `efi_init` (an early page
+  fault, the CPU halts, `panic=` cannot help) when kexec hands it EFI state. With `noefi` the
+  running kernel has no EFI runtime services, and `kexec -s` (kexec_file) then builds
+  `boot_params` without `efi_info`; ACPI is passed as `acpi_rsdp=` (the `ACPI20=` value of
+  `/sys/firmware/efi/systab`). Without `noefi` the leg is skipped with a message. Debian and
+  Unraid run normally after a `noefi` stage-1.
+- **The disks must hold a DSM system.** DSM's installer takes partitions 1 and 2 of every disk
+  as its system and swap arrays and formats them, whatever is there. So the leg runs only if
+  partition 1 of some disk carries an md 0.90 superblock (64 KiB-aligned at its end; magic
+  `a92b4efc` in either byte order, DSM writes it big-endian on some platforms); otherwise
+  stage-1 says `no DSM system on the disks; DSM not started (its installer would format them)`.
+
+The DSM command line is the `kernel` line of the `SYNOLOGY_2` entry of a GRUB 0.97
+`SynoBootLoader.conf` (partition from its `root (hd0,N)`), plus what GRUB's `vender /vender
+show` adds (`macs=`, `sn=`, decoded from the DOM's `vender` file with the DS2415+ layout),
+plus `acpi_rsdp=`. On a GRUB2 DOM (DS923+) the entry is not found and the leg is skipped.
 
 ## Build and test
 

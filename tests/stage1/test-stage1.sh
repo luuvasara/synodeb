@@ -69,6 +69,14 @@ L=$(losetup -f --show -o $((st * 512)) --sizelimit $((used * 512)) $T/disk.img);
 mkfs.ext4 -q $L
 mount $L $T/m && stage2 $T/m md && umount $T/m
 losetup -d $L
+# a second disk whose partition 1 carries a DSM-style md 0.90 superblock (big-endian magic)
+truncate -s 80M $T/dsm.img
+printf 'label: dos\nsize=64MiB\n' | sfdisk -q $T/dsm.img
+ploop $T/dsm.img 1; D=$PL
+sec=$(blockdev --getsz $D)
+printf '\xa9\x2b\x4e\xfc' | dd of=$D bs=4096 seek=$(( (sec / 128 * 128 - 128) / 8 )) conv=notrunc 2>/dev/null
+for l in $LOOPS; do losetup -d $l 2>/dev/null || true; done; LOOPS=
+
 # USB stick: FAT with stage-2 "usb"
 mkstick() { # stage2 dir name
     rm -f $T/stick.img; truncate -s 64M $T/stick.img
@@ -89,6 +97,7 @@ run() { # name expect cmdline-extra [stick]; runs that end in the stage-1 shell 
         -kernel $S1/vmlinuz -initrd $S1/initrd.gz \
         -append "console=ttyS0 panic=-1 stage1.usbwait=6 stage1.settle=12 $extra" \
         -device ahci,id=ahci -drive if=none,id=d0,format=raw,file=$T/disk.img -device ide-hd,drive=d0,bus=ahci.0 \
+        -drive if=none,id=d1,format=raw,file=$T/dsm.img -device ide-hd,drive=d1,bus=ahci.1 \
         "${usb[@]}" < /dev/null > $T/$name.log 2>&1 || true
     if grep -q -- "$expect" $T/$name.log; then echo "== OK: $name ($expect)"; pass=$((pass + 1))
     else echo "== FAIL: $name (no '$expect')"; grep '^stage1:\|STAGE2' $T/$name.log | sed 's/^/   /'; fail=$((fail + 1)); fi
@@ -107,5 +116,10 @@ mkstick stage2
 run stick-as-dom 'set read-only' 'stage1.dom=46f4:0001' stick
 grep -q 'STAGE2 md' $T/stick-as-dom.log && echo "== OK: a DOM is never a stage-2 source" ||
     { echo "== FAIL: DOM used as a source"; fail=$((fail + 1)); }
+run dsm-needs-noefi 'DSM needs stage-1 booted with noefi' 'stage1.order=dsm'
+run dsm-guard 'DSM system array on' 'stage1.order=dsm noefi'
+# the same disk without the superblock: DSM must not be started
+dd if=/dev/zero of=$T/dsm.img bs=1M seek=1 count=64 conv=notrunc 2>/dev/null
+run dsm-guard-none 'no DSM system on the disks' 'stage1.order=dsm noefi'
 echo "passed $pass, failed $fail"
 [ $fail = 0 ]
