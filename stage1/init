@@ -1,0 +1,119 @@
+#!/bin/sh
+# stage-1 of the kexec boot (experimental): a small kernel and initrd on the DOM that find
+# the real system and kexec into it, so that kernel updates never write the DOM.
+#
+# Kernel command line (all optional):
+#   stage1.order=usb,disks      sources, in this order (default)
+#   stage1.usbwait=10           seconds a USB stick gets before the next source is tried
+#   stage1.settle=30            seconds the disks get (md arrays, slow expansion units)
+#   stage1.dom=f400:f400        USB vendor:product of the DOM: made read-only, never a source
+#   stage1.mcu=ttyS1            front-panel microcontroller: status LED green, orange on failure
+#   stage1.shell                a shell after the scan instead of booting
+#
+# usb and disks: the first filesystem with stage2/stage2.conf, a file of three lines
+#   KERNEL=<path>  INITRD=<path>  CMDLINE="<kernel command line>"   (paths in that filesystem)
+# is booted. Renaming stage2/ (e.g. to stage2.off) disables a source.
+export PATH=/bin:/sbin
+mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev
+exec </dev/console >/dev/console 2>&1
+export TERM=dumb   # busybox ash asks a serial console for the cursor position and waits
+
+arg() { # name default
+    v=$(tr ' ' '\n' < /proc/cmdline | sed -n "s/^stage1\.$1=//p" | tail -n 1)
+    echo "${v:-$2}"
+}
+ORDER=$(arg order usb,disks | tr , ' ')
+USBWAIT=$(arg usbwait 10)
+SETTLE=$(arg settle 30)
+DOM_ID=$(arg dom f400:f400)
+MCU=$(arg mcu '')
+led() { [ -z "$MCU" ] || printf '%s' "$1" > "/dev/$MCU" 2>/dev/null || true; }
+
+echo "stage1: $(uname -r)"
+[ -z "$MCU" ] || stty -F "/dev/$MCU" 9600 raw -echo 2>/dev/null
+led 8   # status LED green
+for m in $(cat /etc/modules); do modprobe -q "$m"; done
+
+# The DOM is the one part that is hard to replace: read-only in the kernel before anything
+# else can touch it, and never a stage-2 source.
+is_dom() { # disk
+    d=$(readlink -f "/sys/block/$1/device" 2>/dev/null) || return 1
+    while [ -n "$d" ] && [ "$d" != /sys ]; do
+        if [ -f "$d/idVendor" ]; then
+            [ "$(cat "$d/idVendor"):$(cat "$d/idProduct")" = "$DOM_ID" ]; return
+        fi
+        d=${d%/*}
+    done
+    return 1
+}
+DOM=
+protect_dom() {
+    for b in /sys/block/sd*; do
+        [ -e "$b" ] || continue
+        n=${b##*/}
+        case " $DOM " in *" $n "*) continue ;; esac
+        is_dom "$n" || continue
+        DOM="$DOM $n"
+        for p in /dev/"$n" /dev/"$n"[0-9]*; do blockdev --setro "$p" 2>/dev/null; done
+        echo "stage1: DOM is /dev/$n, set read-only"
+    done
+}
+on_usb() { case "$(readlink -f "/sys/class/block/$1")" in */usb*) return 0 ;; esac; return 1; }
+conf() { # key file: value of KEY=, without surrounding quotes (the file is read, not run)
+    sed -n "s/^$1=//p" "$2" | tail -n 1 | sed 's/^"\(.*\)"$/\1/'
+}
+
+# $1 = usb: USB sticks only; $1 = disks: md arrays first, then partitions, never USB
+try_boot() {
+    for dev in $(awk 'NR > 2 { print $4 }' /proc/partitions | grep -E '^md[0-9]+$') \
+               $(awk 'NR > 2 { print $4 }' /proc/partitions | grep -E '^(sd[a-z]+[0-9]+|nvme.*p[0-9]+)$'); do
+        for n in $DOM; do case $dev in "$n"*) continue 2 ;; esac; done
+        if on_usb "$dev"; then [ "$1" = usb ] || continue; else [ "$1" = disks ] || continue; fi
+        # never mount an md member: with 0.90 and 1.0 superblocks (at the end of the
+        # partition) the filesystem is visible on the member too
+        [ -z "$(ls "/sys/class/block/$dev/holders" 2>/dev/null)" ] || continue
+        mount -o ro,noload "/dev/$dev" /mnt 2>/dev/null || mount -o ro "/dev/$dev" /mnt 2>/dev/null || continue
+        c=/mnt/stage2/stage2.conf
+        if [ -f $c ]; then
+            K=$(conf KERNEL $c); I=$(conf INITRD $c); L=$(conf CMDLINE $c)
+            echo "stage1: stage-2 on $dev: $K $I"
+            if kexec -l "/mnt/$K" ${I:+--initrd="/mnt/$I"} --command-line="$L"; then
+                umount /mnt; led 4; kexec -e
+            fi
+            echo "stage1: kexec failed"
+        fi
+        umount /mnt
+    done
+}
+
+# A source is tried once every source before it has had its wait (usb: usbwait, disks:
+# settle): a stick that is plugged in wins within seconds, the disks come next. Polling, not a fixed sleep: the first source that is there boots at once.
+wait_of() { case $1 in usb) echo "$USBWAIT" ;; disks) echo "$SETTLE" ;; *) echo 0 ;; esac; }
+scan() {
+    mdev -s 2>/dev/null; protect_dom
+    # the system is md RAID1 across the disks: assemble read-only, degraded is fine, so a
+    # slow or switched-off expansion unit does not block the boot (/run holds mdadm's map)
+    mdadm --assemble --scan --run --readonly >/dev/null 2>&1
+}
+if grep -qw stage1.shell /proc/cmdline; then
+    sleep "$USBWAIT"; scan
+    echo "stage1: block devices:"; cat /proc/partitions
+    echo "stage1: shell requested"; exec setsid cttyhack sh
+fi
+echo "stage1: boot order: $ORDER"
+t=0
+while :; do
+    scan
+    gate=0
+    for src in $ORDER; do
+        [ $t -ge $gate ] || break
+        try_boot "$src"
+        w=$(wait_of "$src"); [ "$w" -gt $gate ] && gate=$w
+    done
+    [ $t -ge $gate ] && break   # every source has been tried after its wait
+    sleep 1; t=$((t + 1))
+done
+echo "stage1: block devices:"; cat /proc/partitions
+echo "stage1: no stage-2 found; shell on the console"
+led :   # status LED orange
+exec setsid cttyhack sh

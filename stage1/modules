@@ -1,0 +1,17 @@
+ahci
+libahci
+sd_mod
+ehci_pci
+xhci_pci
+usb_storage
+uas
+vfat
+nls_cp437
+nls_iso8859_1
+nls_ascii
+crc32c_generic
+crc32c_intel
+ext4
+btrfs
+md_mod
+raid1
